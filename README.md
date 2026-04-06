@@ -1,8 +1,11 @@
 # Gradient Boosting within a Single Attention Layer
 
+[![arXiv](https://img.shields.io/badge/arXiv-2604.03190-b31b1b.svg)](https://arxiv.org/abs/2604.03190)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 This repository contains the code and experiments for the paper:
 
-> **Gradient Boosting within a Single Attention Layer**
+> **[Gradient Boosting within a Single Attention Layer](https://arxiv.org/abs/2604.03190)**
 > Saleh Sargolzaei, University of Windsor
 
 We introduce *gradient-boosted attention*, a mechanism that applies gradient boosting within a single attention layer. A second attention pass, with its own learned projections, attends to the prediction error of the first pass and applies a gated correction. Under a squared reconstruction objective, the construction maps onto Friedman's MART framework, with each attention pass as a base learner and the per-dimension gate as the shrinkage parameter.
@@ -79,11 +82,14 @@ python paper/make_figures.py
 ## Citation
 
 ```bibtex
-@article{sargolzaei2026gradient,
-  title={Gradient Boosting within a Single Attention Layer},
-  author={Sargolzaei, Saleh},
-  journal={arXiv preprint},
-  year={2026}
+@misc{sargolzaei2026gradientboostingsingleattention,
+  title={Gradient Boosting within a Single Attention Layer}, 
+  author={Saleh Sargolzaei},
+  year={2026},
+  eprint={2604.03190},
+  archivePrefix={arXiv},
+  primaryClass={cs.LG},
+  url={https://arxiv.org/abs/2604.03190},
 }
 ```
 
