@@ -255,7 +255,10 @@ def build_model(scale, attn_type, device):
 # ============================================================
 
 def prepare_data(seq_len):
-    """Tokenize OpenWebText and save as memory-mapped numpy array."""
+    """Tokenize OpenWebText and save as memory-mapped numpy array.
+
+    Streams tokens to disk in chunks to avoid OOM on large datasets.
+    """
     token_file = DATA_DIR / f'openwebtext_gpt2_{seq_len}.bin'
     meta_file = DATA_DIR / f'openwebtext_gpt2_{seq_len}_meta.json'
 
@@ -276,33 +279,59 @@ def prepare_data(seq_len):
     tokenizer = GPT2TokenizerFast.from_pretrained('gpt2')
     ds = load_dataset('openwebtext', split='train')
 
-    # Tokenize all documents and concatenate
-    print(f'Tokenizing {len(ds):,} documents...')
-    all_tokens = []
-    total = 0
-    for i, doc in enumerate(ds):
-        toks = tokenizer.encode(doc['text'])
-        all_tokens.extend(toks)
-        total += len(toks)
-        if (i + 1) % 500_000 == 0:
-            print(f'  {i+1:,} docs, {total:,} tokens so far...')
-
-    print(f'Total tokens: {total:,}')
-
-    # Split into sequences of (seq_len + 1) for input/target
+    # Phase 1: Tokenize in streaming chunks, write raw tokens to a flat file
+    raw_file = DATA_DIR / f'openwebtext_gpt2_raw.bin'
     chunk_size = seq_len + 1
-    n_sequences = len(all_tokens) // chunk_size
-    all_tokens = all_tokens[:n_sequences * chunk_size]
+    print(f'Tokenizing {len(ds):,} documents (streaming to disk)...')
 
-    # Save as memory-mapped file
-    arr = np.array(all_tokens, dtype=np.uint16).reshape(n_sequences, chunk_size)
-    fp = np.memmap(token_file, dtype=np.uint16, mode='w+', shape=arr.shape)
-    fp[:] = arr[:]
+    total_tokens = 0
+    buffer = np.zeros(1_000_000, dtype=np.uint16)  # 2MB buffer
+    buf_pos = 0
+
+    with open(raw_file, 'wb') as f:
+        for i, doc in enumerate(ds):
+            toks = tokenizer.encode(doc['text'])
+            for t in toks:
+                buffer[buf_pos] = t
+                buf_pos += 1
+                if buf_pos == len(buffer):
+                    f.write(buffer.tobytes())
+                    buf_pos = 0
+            total_tokens += len(toks)
+            if (i + 1) % 500_000 == 0:
+                print(f'  {i+1:,} docs, {total_tokens:,} tokens so far...', flush=True)
+
+        # Flush remaining buffer
+        if buf_pos > 0:
+            f.write(buffer[:buf_pos].tobytes())
+
+    print(f'Total tokens: {total_tokens:,}')
+
+    # Phase 2: Reshape raw tokens into (n_sequences, chunk_size) memmap
+    n_sequences = total_tokens // chunk_size
+    print(f'Creating {n_sequences:,} sequences of length {chunk_size}...')
+
+    # Read raw and write chunked — both as memmaps to avoid RAM spike
+    raw = np.memmap(raw_file, dtype=np.uint16, mode='r',
+                    shape=(n_sequences * chunk_size,))
+    fp = np.memmap(token_file, dtype=np.uint16, mode='w+',
+                   shape=(n_sequences, chunk_size))
+
+    # Copy in batches of 10K sequences
+    batch = 10_000
+    for start in range(0, n_sequences, batch):
+        end = min(start + batch, n_sequences)
+        fp[start:end] = raw[start * chunk_size:end * chunk_size].reshape(end - start, chunk_size)
+        if (start // batch) % 10 == 0:
+            print(f'  {start:,}/{n_sequences:,} sequences written...', flush=True)
     fp.flush()
 
-    meta = {'n_sequences': n_sequences, 'total_tokens': total, 'seq_len': seq_len}
+    meta = {'n_sequences': n_sequences, 'total_tokens': total_tokens, 'seq_len': seq_len}
     meta_file.write_text(json.dumps(meta))
     print(f'Saved {n_sequences:,} sequences to {token_file}')
+
+    # Clean up raw file
+    raw_file.unlink()
 
     return np.memmap(token_file, dtype=np.uint16, mode='r', shape=(n_sequences, chunk_size))
 
