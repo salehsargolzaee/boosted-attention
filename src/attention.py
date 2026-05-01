@@ -206,3 +206,133 @@ class StandardAttention(nn.Module):
             values = keys
         output, weights, entropy = self.attn(query, keys, values)
         return output, weights, entropy
+
+
+# ============================================================
+# Causal Multi-Head Variants (for language modeling)
+# ============================================================
+
+class CausalAttention(nn.Module):
+    """Standard multi-head causal attention."""
+    def __init__(self, d_model, n_heads, dropout=0.1):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.W_qkv = nn.Linear(d_model, 3 * d_model)
+        self.W_out = nn.Linear(d_model, d_model)
+        self.attn_drop = nn.Dropout(dropout)
+        self.scale = self.d_head ** -0.5
+
+    def forward(self, x):
+        B, T, D = x.shape
+        qkv = self.W_qkv(x).reshape(B, T, 3, self.n_heads, self.d_head)
+        q, k, v = qkv.unbind(dim=2)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        attn.masked_fill_(mask, float('-inf'))
+        attn = self.attn_drop(F.softmax(attn, dim=-1))
+        out = (attn @ v).transpose(1, 2).reshape(B, T, D)
+        return self.W_out(out)
+
+
+class BoostedCausalAttention(nn.Module):
+    """Gradient-boosted causal attention: M rounds with separate QKV and learned gate.
+
+    Round 0: Q, K, V all from x.
+    Round 1+: Q from residual (x - cumulative), K and V from original x.
+    """
+    def __init__(self, d_model, n_heads, n_rounds=2, dropout=0.1):
+        super().__init__()
+        self.n_heads = n_heads
+        self.n_rounds = n_rounds
+        self.d_head = d_model // n_heads
+        self.d_model = d_model
+        self.scale = self.d_head ** -0.5
+        self.W_q = nn.ModuleList([nn.Linear(d_model, d_model, bias=False)
+                                  for _ in range(n_rounds)])
+        self.W_kv = nn.ModuleList([nn.Linear(d_model, 2 * d_model, bias=False)
+                                   for _ in range(n_rounds)])
+        self.W_out = nn.Linear(d_model, d_model)
+        self.attn_drop = nn.Dropout(dropout)
+        self.gates = nn.ModuleList([
+            nn.Sequential(nn.Linear(2 * d_model, d_model), nn.Sigmoid())
+            for _ in range(n_rounds - 1)
+        ])
+        self.capturing = False
+        self._cached = {}
+
+    def _attend(self, x_q, x_kv, round_idx):
+        B, T, D = x_q.shape
+        q = self.W_q[round_idx](x_q).reshape(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        kv = self.W_kv[round_idx](x_kv).reshape(B, T, 2, self.n_heads, self.d_head)
+        k, v = kv.unbind(dim=2)
+        k, v = k.transpose(1, 2), v.transpose(1, 2)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x_q.device), diagonal=1).bool()
+        attn.masked_fill_(mask, float('-inf'))
+        attn = self.attn_drop(F.softmax(attn, dim=-1))
+        out = (attn @ v).transpose(1, 2).reshape(B, T, D)
+        if self.capturing:
+            self._cached['attn'].append(attn.detach())
+            self._cached['v'].append(v.detach())
+        return out
+
+    def enable_capture(self):
+        self.capturing = True
+        self._cached = {'attn': [], 'v': [], 'gate': [], 'pred_r0': None,
+                        'output_pre_proj': None}
+
+    def disable_capture(self):
+        self.capturing = False
+        self._cached = {}
+
+    def forward(self, x):
+        pred = self._attend(x, x, 0)
+        if self.capturing:
+            self._cached['pred_r0'] = pred.detach()
+        output = pred
+        cumulative = pred
+        for i in range(1, self.n_rounds):
+            residual = x - cumulative
+            correction = self._attend(residual, x, i)
+            gate = self.gates[i - 1](torch.cat([cumulative, correction], dim=-1))
+            if self.capturing:
+                self._cached['gate'].append(gate.detach())
+            gated = gate * correction
+            output = output + gated
+            cumulative = cumulative + gated
+        if self.capturing:
+            self._cached['output_pre_proj'] = output.detach()
+        return self.W_out(output)
+
+
+class TwicingCausalAttention(nn.Module):
+    """Twicing Attention (Abdullaev & Nguyen, ICLR 2025).
+
+    Output = (2A - A^2)V = AV + A(V - AV).
+    Uses the SAME attention matrix A for both passes.
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.W_qkv = nn.Linear(d_model, 3 * d_model)
+        self.W_out = nn.Linear(d_model, d_model)
+        self.attn_drop = nn.Dropout(dropout)
+        self.scale = self.d_head ** -0.5
+
+    def forward(self, x):
+        B, T, D = x.shape
+        qkv = self.W_qkv(x).reshape(B, T, 3, self.n_heads, self.d_head)
+        q, k, v = qkv.unbind(dim=2)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        attn.masked_fill_(mask, float('-inf'))
+        A = self.attn_drop(F.softmax(attn, dim=-1))
+        Av = A @ v
+        residual = v - Av
+        correction = A @ residual
+        out = (Av + correction).transpose(1, 2).reshape(B, T, D)
+        return self.W_out(out)

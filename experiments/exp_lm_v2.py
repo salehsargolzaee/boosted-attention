@@ -22,6 +22,8 @@ import numpy as np
 from pathlib import Path
 from datasets import load_dataset
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers
+from attention import (CausalAttention, BoostedCausalAttention,
+                       TwicingCausalAttention)
 
 RESULTS_DIR = Path(__file__).parent.parent / 'results'
 RESULTS_DIR.mkdir(exist_ok=True)
@@ -73,114 +75,6 @@ def get_wikitext_data(seq_len=256, vocab_size=16384, max_train_tokens=None):
     print(f'Train: {len(train_data)*seq_len:,} tokens, '
           f'Val: {len(val_data)*seq_len:,}, Test: {len(test_data)*seq_len:,}')
     return train_data, val_data, test_data, tokenizer, actual_vocab
-
-
-# ============================================================
-# Attention Modules
-# ============================================================
-
-class CausalAttention(nn.Module):
-    """Standard multi-head causal attention."""
-    def __init__(self, d_model, n_heads, dropout=0.1):
-        super().__init__()
-        self.n_heads = n_heads
-        self.d_head = d_model // n_heads
-        self.W_qkv = nn.Linear(d_model, 3 * d_model)
-        self.W_out = nn.Linear(d_model, d_model)
-        self.attn_drop = nn.Dropout(dropout)
-        self.scale = self.d_head ** -0.5
-
-    def forward(self, x):
-        B, T, D = x.shape
-        qkv = self.W_qkv(x).reshape(B, T, 3, self.n_heads, self.d_head)
-        q, k, v = qkv.unbind(dim=2)
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
-        attn.masked_fill_(mask, float('-inf'))
-        attn = self.attn_drop(F.softmax(attn, dim=-1))
-        out = (attn @ v).transpose(1, 2).reshape(B, T, D)
-        return self.W_out(out)
-
-
-class BoostedCausalAttention(nn.Module):
-    """Boosted Attention: M rounds with separate QKV and learned gate."""
-    def __init__(self, d_model, n_heads, n_rounds=2, dropout=0.1):
-        super().__init__()
-        self.n_heads = n_heads
-        self.n_rounds = n_rounds
-        self.d_head = d_model // n_heads
-        self.scale = self.d_head ** -0.5
-        self.W_qkvs = nn.ModuleList([
-            nn.Linear(d_model, 3 * d_model) for _ in range(n_rounds)
-        ])
-        self.W_out = nn.Linear(d_model, d_model)
-        self.attn_drop = nn.Dropout(dropout)
-        self.gates = nn.ModuleList([
-            nn.Sequential(nn.Linear(2 * d_model, d_model), nn.Sigmoid())
-            for _ in range(n_rounds - 1)
-        ])
-
-    def _attend(self, x, round_idx):
-        B, T, D = x.shape
-        qkv = self.W_qkvs[round_idx](x).reshape(B, T, 3, self.n_heads, self.d_head)
-        q, k, v = qkv.unbind(dim=2)
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
-        attn.masked_fill_(mask, float('-inf'))
-        attn = self.attn_drop(F.softmax(attn, dim=-1))
-        return (attn @ v).transpose(1, 2).reshape(B, T, D)
-
-    def forward(self, x):
-        pred = self._attend(x, 0)
-        output = pred
-        cumulative = pred
-        for i in range(1, self.n_rounds):
-            residual = x - cumulative
-            correction = self._attend(residual, i)
-            gate = self.gates[i - 1](torch.cat([cumulative, correction], dim=-1))
-            gated = gate * correction
-            output = output + gated
-            cumulative = cumulative + gated
-        return self.W_out(output)
-
-
-class TwicingCausalAttention(nn.Module):
-    """
-    Twicing Attention (Abdullaev & Nguyen, ICLR 2025).
-
-    Output = (2A - A^2)V = AV + A(V - AV)
-    Uses the SAME attention matrix A for both passes.
-    No learned gate, no separate projections.
-    """
-    def __init__(self, d_model, n_heads, dropout=0.1):
-        super().__init__()
-        self.n_heads = n_heads
-        self.d_head = d_model // n_heads
-        self.W_qkv = nn.Linear(d_model, 3 * d_model)
-        self.W_out = nn.Linear(d_model, d_model)
-        self.attn_drop = nn.Dropout(dropout)
-        self.scale = self.d_head ** -0.5
-
-    def forward(self, x):
-        B, T, D = x.shape
-        qkv = self.W_qkv(x).reshape(B, T, 3, self.n_heads, self.d_head)
-        q, k, v = qkv.unbind(dim=2)
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-
-        # Compute attention weights (shared for both passes)
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
-        attn.masked_fill_(mask, float('-inf'))
-        A = self.attn_drop(F.softmax(attn, dim=-1))
-
-        # Twicing: AV + A(V - AV) = (2A - A^2)V
-        Av = A @ v                   # first pass
-        residual = v - Av            # what attention missed
-        correction = A @ residual    # smooth the residual with same A
-        out = (Av + correction).transpose(1, 2).reshape(B, T, D)
-        return self.W_out(out)
 
 
 # ============================================================
@@ -384,6 +278,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--scale', default='small', choices=['small', 'medium', 'all'])
     parser.add_argument('--seeds', type=int, nargs='+', default=[42, 123])
+    parser.add_argument('--attn', type=str, nargs='+', default=None,
+                        help='Only run these attention types (e.g. --attn boosted)')
     parser.add_argument('--dry', action='store_true', help='Print configs and exit')
     args = parser.parse_args()
 
@@ -412,7 +308,7 @@ if __name__ == '__main__':
         print(f'{"="*70}')
 
         # Build config list
-        configs = [
+        all_configs = [
             (f'{scale_name}/Standard', 'standard', d, nl, nh, 1),
             (f'{scale_name}/Boosted-2', 'boosted', d, nl, nh, 2),
             (f'{scale_name}/Twicing', 'twicing', d, nl, nh, 1),
@@ -424,10 +320,16 @@ if __name__ == '__main__':
         del m_b
         fair_d, fair_n = find_param_fair_d(actual_vocab, n_boost, nl, nh, seq_len)
         if fair_d:
-            configs.append(
+            all_configs.append(
                 (f'{scale_name}/Std-fair(d={fair_d})', 'standard', fair_d, nl, nh, 1))
             print(f'  Param-fair: d={fair_d}, {fair_n:,} params '
                   f'(boosted={n_boost:,})')
+
+        # Filter by --attn if specified
+        if args.attn:
+            configs = [c for c in all_configs if c[1] in args.attn]
+        else:
+            configs = all_configs
 
         if args.dry:
             for label, atype, dm, nlr, nhr, nr in configs:

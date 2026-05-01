@@ -4,12 +4,15 @@ Post-hoc analysis of trained gradient-boosted attention models.
 Analyses:
   1. Gate analysis — per-dimension gate values across layers
   2. Attention entropy — round 0 vs round 1 entropy distributions
+  3. Example-level corrections — tokens where boosted fixes standard's errors
+  4. Convex hull escape — does the correction push output outside conv(V⁰)?
 
 All analyses use saved checkpoints, no retraining needed.
 """
 
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import torch
 import torch.nn as nn
@@ -19,9 +22,11 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from pathlib import Path
+from scipy.optimize import linprog
 
-from exp_lm_v2 import (TransformerLM, CausalAttention, BoostedCausalAttention,
-                        TwicingCausalAttention, get_wikitext_data)
+from exp_lm_v2 import TransformerLM, get_wikitext_data
+from attention import (CausalAttention, BoostedCausalAttention,
+                       TwicingCausalAttention)
 
 RESULTS_DIR = Path(__file__).parent.parent / 'results'
 CKPT_DIR = RESULTS_DIR / 'checkpoints'
@@ -55,61 +60,22 @@ def load_model(label, seed=42):
     return model
 
 
-class BoostedCausalAttentionHooked(BoostedCausalAttention):
-    """Boosted attention that stores intermediate attention weights and gate values."""
-
-    def forward(self, x):
-        self._round_attns = []
-        self._gate_values = []
-
-        B, T, D = x.shape
-        # Round 0
-        qkv = self.W_qkvs[0](x).reshape(B, T, 3, self.n_heads, self.d_head)
-        q, k, v = qkv.unbind(dim=2)
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
-        attn.masked_fill_(mask, float('-inf'))
-        attn_weights = F.softmax(attn, dim=-1)
-        self._round_attns.append(attn_weights.detach())
-        pred = (attn_weights @ v).transpose(1, 2).reshape(B, T, D)
-
-        output = pred
-        cumulative = pred
-
-        for i in range(1, self.n_rounds):
-            residual = x - cumulative
-
-            qkv = self.W_qkvs[i](residual).reshape(B, T, 3, self.n_heads, self.d_head)
-            q, k, v = qkv.unbind(dim=2)
-            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            attn = (q @ k.transpose(-2, -1)) * self.scale
-            attn.masked_fill_(mask, float('-inf'))
-            attn_weights = F.softmax(attn, dim=-1)
-            self._round_attns.append(attn_weights.detach())
-            correction = (attn_weights @ v).transpose(1, 2).reshape(B, T, D)
-
-            gate = self.gates[i - 1](torch.cat([cumulative, correction], dim=-1))
-            self._gate_values.append(gate.detach())
-
-            gated = gate * correction
-            output = output + gated
-            cumulative = cumulative + gated
-
-        return self.W_out(output)
-
-
-def hook_boosted_model(model):
-    """Replace BoostedCausalAttention layers with hooked versions."""
+def enable_capture(model):
     for layer in model.layers:
         attn = layer['attn']
         if isinstance(attn, BoostedCausalAttention):
-            hooked = BoostedCausalAttentionHooked(
-                attn.W_qkvs[0].in_features, attn.n_heads, attn.n_rounds)
-            hooked.load_state_dict(attn.state_dict())
-            hooked.eval()
-            layer['attn'] = hooked
-    return model
+            attn.enable_capture()
+
+
+def disable_capture(model):
+    for layer in model.layers:
+        attn = layer['attn']
+        if isinstance(attn, BoostedCausalAttention):
+            attn.disable_capture()
+
+
+def get_cached(model, layer_idx):
+    return model.layers[layer_idx]['attn']._cached
 
 
 # ============================================================
@@ -120,6 +86,7 @@ def analysis_gate_values(model, test_data):
     """Per-dimension gate values averaged over test sequences, per layer."""
     print('\n=== Analysis 1: Gate Values ===')
 
+    enable_capture(model)
     gate_stats = {i: [] for i in range(4)}
     n_batches = min(50, len(test_data))
 
@@ -127,11 +94,13 @@ def analysis_gate_values(model, test_data):
         for b in range(n_batches):
             x = test_data[b:b+1]
             _ = model(x[:, :-1])
-            for i, layer in enumerate(model.layers):
-                attn = layer['attn']
-                if hasattr(attn, '_gate_values') and attn._gate_values:
-                    g = attn._gate_values[0].numpy()  # (1, T, d)
+            for i in range(4):
+                cached = get_cached(model, i)
+                if cached.get('gate'):
+                    g = cached['gate'][0].numpy()  # (1, T, d)
                     gate_stats[i].append(g.mean(axis=(0, 1)))
+
+    disable_capture(model)
 
     fig, axes = plt.subplots(1, 4, figsize=(12, 3))
     for i in range(4):
@@ -173,26 +142,29 @@ def analysis_attention_entropy(model, test_data):
     """Compare entropy of attention distributions between round 0 and round 1."""
     print('\n=== Analysis 2: Attention Entropy ===')
 
+    enable_capture(model)
     entropy_r0_all = []
     entropy_r1_all = []
+    layer_entropies = {i: {'r0': [], 'r1': []} for i in range(4)}
     n_batches = min(50, len(test_data))
 
     with torch.no_grad():
         for b in range(n_batches):
             x = test_data[b:b+1]
             _ = model(x[:, :-1])
-            for layer in model.layers:
-                attn = layer['attn']
-                if hasattr(attn, '_round_attns') and len(attn._round_attns) >= 2:
-                    # attn weights shape: (B, n_heads, T, T)
-                    a0 = attn._round_attns[0]
-                    a1 = attn._round_attns[1]
-                    # Entropy per query position: -sum(p log p), averaged over heads
-                    # Clamp to avoid log(0)
-                    e0 = -(a0 * torch.log(a0.clamp(min=1e-10))).sum(dim=-1)  # (B, H, T)
+            for i in range(4):
+                cached = get_cached(model, i)
+                if len(cached.get('attn', [])) >= 2:
+                    a0 = cached['attn'][0]
+                    a1 = cached['attn'][1]
+                    e0 = -(a0 * torch.log(a0.clamp(min=1e-10))).sum(dim=-1)
                     e1 = -(a1 * torch.log(a1.clamp(min=1e-10))).sum(dim=-1)
                     entropy_r0_all.append(e0.reshape(-1).numpy())
                     entropy_r1_all.append(e1.reshape(-1).numpy())
+                    layer_entropies[i]['r0'].append(e0.mean().item())
+                    layer_entropies[i]['r1'].append(e1.mean().item())
+
+    disable_capture(model)
 
     entropy_r0 = np.concatenate(entropy_r0_all)
     entropy_r1 = np.concatenate(entropy_r1_all)
@@ -201,7 +173,6 @@ def analysis_attention_entropy(model, test_data):
     print(f'  Round 1 entropy: mean={entropy_r1.mean():.3f}, median={np.median(entropy_r1):.3f}')
     print(f'  Entropy reduction: {(entropy_r0.mean() - entropy_r1.mean()) / entropy_r0.mean() * 100:.1f}% relative')
 
-    # Only produce figure if the difference is meaningful
     diff = entropy_r0.mean() - entropy_r1.mean()
     if abs(diff) < 0.01 * entropy_r0.mean():
         print('  Entropy difference < 1% — not significant enough to plot.')
@@ -209,7 +180,6 @@ def analysis_attention_entropy(model, test_data):
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9, 3.5))
 
-    # Left: overlaid histograms
     bins = np.linspace(0, max(entropy_r0.max(), entropy_r1.max()), 60)
     ax1.hist(entropy_r0, bins=bins, alpha=0.6, color='#2980b9', label='Round 0 (initial)', density=True)
     ax1.hist(entropy_r1, bins=bins, alpha=0.6, color='#e74c3c', label='Round 1 (correction)', density=True)
@@ -218,23 +188,6 @@ def analysis_attention_entropy(model, test_data):
     ax1.set_title('Attention Entropy Distribution', fontsize=11, fontweight='bold')
     ax1.legend(fontsize=8)
     ax1.grid(True, alpha=0.2, ls='--')
-
-    # Right: per-layer breakdown
-    # Re-collect per layer
-    layer_entropies = {i: {'r0': [], 'r1': []} for i in range(4)}
-    with torch.no_grad():
-        for b in range(n_batches):
-            x = test_data[b:b+1]
-            _ = model(x[:, :-1])
-            for i, layer in enumerate(model.layers):
-                attn = layer['attn']
-                if hasattr(attn, '_round_attns') and len(attn._round_attns) >= 2:
-                    a0 = attn._round_attns[0]
-                    a1 = attn._round_attns[1]
-                    e0 = -(a0 * torch.log(a0.clamp(min=1e-10))).sum(dim=-1).mean().item()
-                    e1 = -(a1 * torch.log(a1.clamp(min=1e-10))).sum(dim=-1).mean().item()
-                    layer_entropies[i]['r0'].append(e0)
-                    layer_entropies[i]['r1'].append(e1)
 
     layers = range(4)
     r0_means = [np.mean(layer_entropies[i]['r0']) for i in layers]
@@ -269,12 +222,11 @@ def analysis_attention_entropy(model, test_data):
 # ============================================================
 
 def analysis_example_corrections(model_std, model_boosted, test_data, tokenizer):
-    """Find tokens where the correction round fixes a prediction error,
-    and visualize what round 0 vs round 1 attend to."""
+    """Find tokens where the correction round fixes a prediction error."""
     print('\n=== Analysis 3: Example Corrections ===')
 
-    # Step 1: Find positions with largest per-token loss improvement
-    candidates = []  # (batch_idx, token_pos, loss_std, loss_boost, target_id)
+    enable_capture(model_boosted)
+    candidates = []
     n_batches = min(200, len(test_data))
 
     with torch.no_grad():
@@ -291,15 +243,12 @@ def analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
                 logits_boost.reshape(-1, logits_boost.size(-1)),
                 targets.reshape(-1), reduction='none')
 
-            improvement = loss_std - loss_boost  # positive = boosted is better
+            improvement = loss_std - loss_boost
             for pos in range(len(improvement)):
-                if improvement[pos] > 1.5:  # substantial improvement (>1.5 nats)
-                    # Get top-1 predictions
+                if improvement[pos] > 1.5:
                     pred_std = logits_std[0, pos].argmax().item()
                     pred_boost = logits_boost[0, pos].argmax().item()
                     target = targets[0, pos].item()
-                    # Only keep if boosted gets it right and standard doesn't,
-                    # or boosted is much closer
                     candidates.append({
                         'batch': b, 'pos': pos,
                         'loss_std': loss_std[pos].item(),
@@ -311,7 +260,6 @@ def analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
                         'std_correct': pred_std == target,
                     })
 
-    # Sort by improvement, prefer cases where boosted is correct and standard isn't
     candidates.sort(key=lambda c: (c['boost_correct'] and not c['std_correct'],
                                     c['improvement']), reverse=True)
 
@@ -319,7 +267,6 @@ def analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
     print(f'  Of those, {sum(c["boost_correct"] and not c["std_correct"] for c in candidates)} '
           f'have boosted correct & standard wrong')
 
-    # Step 2: Select up to 3 good examples from DIFFERENT sequences
     selected = []
     used_batches = set()
     for c in candidates:
@@ -327,7 +274,7 @@ def analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
             break
         b, pos = c['batch'], c['pos']
         if any(abs(b - ub) < 50 for ub in used_batches):
-            continue  # enforce diversity: skip nearby sequences (likely same article)
+            continue
         if pos < 10:
             continue
         x = test_data[b]
@@ -342,9 +289,9 @@ def analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
 
     if len(selected) < 2:
         print('  Not enough good examples found.')
+        disable_capture(model_boosted)
         return
 
-    # Step 3: Overlaid attention bars for each example
     fig, axes = plt.subplots(len(selected), 1, figsize=(7, 2.5 * len(selected)))
     if len(selected) == 1:
         axes = [axes]
@@ -356,10 +303,9 @@ def analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
         with torch.no_grad():
             _ = model_boosted(x[:, :-1])
 
-        # Use layer 1 (strongest correction per entropy/gate analysis)
-        layer = model_boosted.layers[1]['attn']
-        attn_r0 = layer._round_attns[0][0].mean(dim=0).numpy()
-        attn_r1 = layer._round_attns[1][0].mean(dim=0).numpy()
+        cached = get_cached(model_boosted, 1)  # layer 1
+        attn_r0 = cached['attn'][0][0].mean(dim=0).numpy()
+        attn_r1 = cached['attn'][1][0].mean(dim=0).numpy()
 
         ctx_start = c['context_start']
         ctx_end = pos + 1
@@ -368,7 +314,6 @@ def analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
         attn_r0_row = attn_r0[pos, ctx_start:ctx_end]
         attn_r1_row = attn_r1[pos, ctx_start:ctx_end]
 
-        # Decode token labels, joining BPE fragments with previous token
         raw_labels = []
         for tid in x[0, ctx_start:ctx_end].tolist():
             tok = tokenizer.decode([tid])
@@ -392,8 +337,7 @@ def analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
         if row == 0:
             ax.legend(fontsize=7, loc='upper left', ncol=2)
 
-        # Title with prediction info
-        marker = '\u2713' if c['boost_correct'] else ''
+        marker = '✓' if c['boost_correct'] else ''
         ax.set_title(
             f'Target: "{target_tok}"    '
             f'Standard: "{pred_std_tok}" (loss {c["loss_std"]:.1f})    '
@@ -408,7 +352,6 @@ def analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
     plt.close()
     print('  Saved fig_example_corrections')
 
-    # Print details for verification
     for i, c in enumerate(selected):
         target_tok = tokenizer.decode([c['target']]).strip()
         pred_std_tok = tokenizer.decode([c['pred_std']]).strip()
@@ -419,6 +362,162 @@ def analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
         print(f'    Target: "{target_tok}", Std pred: "{pred_std_tok}", Boost pred: "{pred_boost_tok}"')
         print(f'    Loss std={c["loss_std"]:.2f}, boost={c["loss_boost"]:.2f}, '
               f'improvement={c["improvement"]:.2f} nats')
+
+    disable_capture(model_boosted)
+
+
+# ============================================================
+# Analysis 4: Convex hull escape
+# ============================================================
+
+def dist_to_conv_hull(point, vertices):
+    """Distance from point to conv(vertices) via QP relaxation.
+
+    Solves: min ||point - V @ alpha||^2  s.t. alpha >= 0, sum(alpha) = 1
+    Uses scipy linprog on the dual for efficiency.
+
+    Args:
+        point: (d,) numpy array
+        vertices: (N, d) numpy array, rows are vertices
+    Returns:
+        distance (float)
+    """
+    N, d = vertices.shape
+    # Least-squares with simplex constraint: min ||Va - p||^2
+    # Equivalent to: min a^T (V^T V) a - 2 p^T V a  s.t. a >= 0, 1^T a = 1
+    from scipy.optimize import minimize
+    G = vertices @ vertices.T  # (N, N)
+    c = vertices @ point       # (N,)
+
+    def objective(a):
+        return 0.5 * a @ G @ a - c @ a
+
+    def gradient(a):
+        return G @ a - c
+
+    a0 = np.ones(N) / N
+    constraints = {'type': 'eq', 'fun': lambda a: a.sum() - 1.0}
+    bounds = [(0, None)] * N
+    result = minimize(objective, a0, jac=gradient, method='SLSQP',
+                      bounds=bounds, constraints=constraints,
+                      options={'maxiter': 200, 'ftol': 1e-10})
+    nearest = vertices.T @ result.x
+    return float(np.linalg.norm(point - nearest))
+
+
+def analysis_convex_hull(model, test_data):
+    """Check whether the boosted output escapes conv(V⁰) — the convex hull
+    of round-0 value vectors."""
+    print('\n=== Analysis 4: Convex Hull Escape ===')
+
+    enable_capture(model)
+    n_batches = min(30, len(test_data))
+
+    # Per-layer stats
+    layer_stats = {i: {'dist_r0': [], 'dist_final': [], 'gate_mean': []}
+                   for i in range(4)}
+
+    with torch.no_grad():
+        for b in range(n_batches):
+            x = test_data[b:b+1]
+            _ = model(x[:, :-1])
+
+            for li in range(4):
+                cached = get_cached(model, li)
+                if not cached.get('v') or len(cached['v']) < 2:
+                    continue
+
+                # v_r0: (B, H, T, d_head) — round 0 values
+                v_r0 = cached['v'][0]
+                pred_r0 = cached['pred_r0']       # (B, T, D)
+                out_pre = cached['output_pre_proj']  # (B, T, D)
+                gate = cached['gate'][0] if cached['gate'] else None
+
+                B, H, T, d_h = v_r0.shape
+
+                # Sample a few positions per sequence to keep cost manageable
+                positions = np.random.choice(range(10, T), size=min(5, T-10), replace=False)
+
+                for pos in positions:
+                    for h in range(H):
+                        # Vertices: causal values up to position pos
+                        verts = v_r0[0, h, :pos+1].numpy()  # (pos+1, d_head)
+                        # Round 0 output for this head at this position
+                        r0_head = pred_r0[0, pos, h*d_h:(h+1)*d_h].numpy()
+                        # Final output (pre W_out) for this head at this position
+                        final_head = out_pre[0, pos, h*d_h:(h+1)*d_h].numpy()
+
+                        d_r0 = dist_to_conv_hull(r0_head, verts)
+                        d_final = dist_to_conv_hull(final_head, verts)
+
+                        layer_stats[li]['dist_r0'].append(d_r0)
+                        layer_stats[li]['dist_final'].append(d_final)
+
+                if gate is not None:
+                    layer_stats[li]['gate_mean'].append(gate.mean().item())
+
+            if (b + 1) % 10 == 0:
+                print(f'  Processed {b+1}/{n_batches} batches')
+
+    disable_capture(model)
+
+    # Print stats
+    print('\n  Results (distance to conv(V⁰)):')
+    for li in range(4):
+        s = layer_stats[li]
+        if not s['dist_r0']:
+            continue
+        dr0 = np.array(s['dist_r0'])
+        df = np.array(s['dist_final'])
+        escaped = (df > 1e-4).mean() * 100
+        print(f'    Layer {li}: round0 dist={dr0.mean():.4f}±{dr0.std():.4f}, '
+              f'final dist={df.mean():.4f}±{df.std():.4f}, '
+              f'escaped={escaped:.1f}%')
+
+    # Plot
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+    # Left: distance comparison per layer
+    ax = axes[0]
+    layers_with_data = [i for i in range(4) if layer_stats[i]['dist_r0']]
+    x_pos = np.arange(len(layers_with_data))
+    w = 0.35
+    r0_means = [np.mean(layer_stats[i]['dist_r0']) for i in layers_with_data]
+    final_means = [np.mean(layer_stats[i]['dist_final']) for i in layers_with_data]
+    r0_stds = [np.std(layer_stats[i]['dist_r0']) for i in layers_with_data]
+    final_stds = [np.std(layer_stats[i]['dist_final']) for i in layers_with_data]
+
+    ax.bar(x_pos - w/2, r0_means, w, yerr=r0_stds, color='#2980b9', alpha=0.8,
+           label='Round 0 output', capsize=3)
+    ax.bar(x_pos + w/2, final_means, w, yerr=final_stds, color='#e74c3c', alpha=0.8,
+           label='Final boosted output', capsize=3)
+    ax.set_xlabel('Layer')
+    ax.set_ylabel('Distance to conv($V^{(0)}$)')
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels([f'Layer {i}' for i in layers_with_data])
+    ax.set_title('Distance to Round-0 Value Hull', fontsize=11, fontweight='bold')
+    ax.legend(fontsize=8)
+    ax.grid(axis='y', alpha=0.2, ls='--')
+
+    # Right: histogram of final distances for the most active layer
+    best_layer = max(layers_with_data,
+                     key=lambda i: np.mean(layer_stats[i]['dist_final']))
+    ax = axes[1]
+    df = np.array(layer_stats[best_layer]['dist_final'])
+    ax.hist(df, bins=40, color='#e74c3c', alpha=0.7, edgecolor='white')
+    ax.axvline(0, color='gray', ls='--', lw=1)
+    escaped_pct = (df > 1e-4).mean() * 100
+    ax.set_xlabel('Distance to conv($V^{(0)}$)')
+    ax.set_ylabel('Count')
+    ax.set_title(f'Layer {best_layer}: {escaped_pct:.0f}% of outputs escape conv($V^{{(0)}}$)',
+                 fontsize=10, fontweight='bold')
+    ax.grid(axis='y', alpha=0.2, ls='--')
+
+    plt.tight_layout()
+    for ext in ['pdf', 'png']:
+        plt.savefig(PAPER_DIR / f'fig_convex_hull.{ext}')
+    plt.close()
+    print('  Saved fig_convex_hull')
 
 
 # ============================================================
@@ -431,13 +530,13 @@ if __name__ == '__main__':
     print('Loading models...')
     model_std = load_model('Standard', seed=42)
     model_boosted = load_model('Boosted-2', seed=42)
-    model_boosted = hook_boosted_model(model_boosted)
     print(f'Standard params: {sum(p.numel() for p in model_std.parameters()):,}')
     print(f'Boosted params: {sum(p.numel() for p in model_boosted.parameters()):,}')
 
     analysis_gate_values(model_boosted, test_data)
     entropy_significant = analysis_attention_entropy(model_boosted, test_data)
     analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
+    analysis_convex_hull(model_boosted, test_data)
 
     if not entropy_significant:
         print('\nNote: Entropy analysis not significant — only gate figure produced.')

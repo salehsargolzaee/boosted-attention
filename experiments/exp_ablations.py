@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import time
 
-from boosted_attention import BoostedAttention, StandardAttention, BoostedAttentionOutput
+from attention import BoostedAttention, StandardAttention, BoostedAttentionOutput
 
 RESULTS_DIR = Path(__file__).parent.parent / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
