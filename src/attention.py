@@ -240,19 +240,20 @@ class BoostedCausalAttention(nn.Module):
     """Gradient-boosted causal attention: M rounds with separate QKV and learned gate.
 
     Round 0: Q, K, V all from x.
-    Round 1+: Q from residual (x - cumulative), K and V from original x.
+    Round 1+: Q, K, V all from residual (default, kv_source='residual')
+              or Q from residual, K/V from x (kv_source='input').
     """
-    def __init__(self, d_model, n_heads, n_rounds=2, dropout=0.1):
+    def __init__(self, d_model, n_heads, n_rounds=2, dropout=0.1,
+                 kv_source='residual'):
         super().__init__()
         self.n_heads = n_heads
         self.n_rounds = n_rounds
         self.d_head = d_model // n_heads
         self.d_model = d_model
+        self.kv_source = kv_source
         self.scale = self.d_head ** -0.5
-        self.W_q = nn.ModuleList([nn.Linear(d_model, d_model, bias=False)
-                                  for _ in range(n_rounds)])
-        self.W_kv = nn.ModuleList([nn.Linear(d_model, 2 * d_model, bias=False)
-                                   for _ in range(n_rounds)])
+        self.W_qkvs = nn.ModuleList([nn.Linear(d_model, 3 * d_model)
+                                     for _ in range(n_rounds)])
         self.W_out = nn.Linear(d_model, d_model)
         self.attn_drop = nn.Dropout(dropout)
         self.gates = nn.ModuleList([
@@ -264,8 +265,11 @@ class BoostedCausalAttention(nn.Module):
 
     def _attend(self, x_q, x_kv, round_idx):
         B, T, D = x_q.shape
-        q = self.W_q[round_idx](x_q).reshape(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        kv = self.W_kv[round_idx](x_kv).reshape(B, T, 2, self.n_heads, self.d_head)
+        W = self.W_qkvs[round_idx]
+        q = F.linear(x_q, W.weight[:D], W.bias[:D]).reshape(
+            B, T, self.n_heads, self.d_head).transpose(1, 2)
+        kv = F.linear(x_kv, W.weight[D:], W.bias[D:]).reshape(
+            B, T, 2, self.n_heads, self.d_head)
         k, v = kv.unbind(dim=2)
         k, v = k.transpose(1, 2), v.transpose(1, 2)
         attn = (q @ k.transpose(-2, -1)) * self.scale
@@ -295,7 +299,8 @@ class BoostedCausalAttention(nn.Module):
         cumulative = pred
         for i in range(1, self.n_rounds):
             residual = x - cumulative
-            correction = self._attend(residual, x, i)
+            x_kv = residual if self.kv_source == 'residual' else x
+            correction = self._attend(residual, x_kv, i)
             gate = self.gates[i - 1](torch.cat([cumulative, correction], dim=-1))
             if self.capturing:
                 self._cached['gate'].append(gate.detach())

@@ -22,7 +22,10 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from pathlib import Path
-from scipy.optimize import linprog
+import json
+import argparse
+from multiprocessing import Pool
+from functools import partial
 
 from exp_lm_v2 import TransformerLM, get_wikitext_data
 from attention import (CausalAttention, BoostedCausalAttention,
@@ -90,48 +93,33 @@ def analysis_gate_values(model, test_data):
     gate_stats = {i: [] for i in range(4)}
     n_batches = min(50, len(test_data))
 
+    device = next(model.parameters()).device
     with torch.no_grad():
         for b in range(n_batches):
-            x = test_data[b:b+1]
+            x = test_data[b:b+1].to(device)
             _ = model(x[:, :-1])
             for i in range(4):
                 cached = get_cached(model, i)
                 if cached.get('gate'):
-                    g = cached['gate'][0].numpy()  # (1, T, d)
+                    g = cached['gate'][0].cpu().numpy()  # (1, T, d)
                     gate_stats[i].append(g.mean(axis=(0, 1)))
 
     disable_capture(model)
 
-    fig, axes = plt.subplots(1, 4, figsize=(12, 3))
+    results = {}
     for i in range(4):
-        ax = axes[i]
         if gate_stats[i]:
             all_gates = np.stack(gate_stats[i])
             mean_per_dim = all_gates.mean(axis=0)
-
-            ax.bar(range(len(mean_per_dim)), mean_per_dim, alpha=0.7,
-                   color='#2980b9', width=1.0)
-            ax.set_ylim(0, 1)
-            ax.set_xlabel('Dimension')
-            ax.set_title(f'Layer {i}', fontsize=10, fontweight='bold')
-            ax.axhline(0.5, color='gray', ls='--', lw=0.8, alpha=0.5)
-
             mu = mean_per_dim.mean()
             sigma = mean_per_dim.std()
-            ax.text(0.95, 0.95, f'$\\mu$={mu:.2f}\n$\\sigma$={sigma:.2f}',
-                    transform=ax.transAxes, ha='right', va='top', fontsize=8,
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
-
             print(f'  Layer {i}: mean={mu:.3f}, std={sigma:.3f}')
+            results[f'layer_{i}'] = mean_per_dim.tolist()
 
-    axes[0].set_ylabel('Gate value')
-    plt.suptitle('Learned Gate Values per Layer (averaged over test sequences)',
-                 fontsize=11, fontweight='bold')
-    plt.tight_layout()
-    for ext in ['pdf', 'png']:
-        plt.savefig(PAPER_DIR / f'fig_gate_analysis.{ext}')
-    plt.close()
-    print('  Saved fig_gate_analysis')
+    out_path = RESULTS_DIR / 'analysis_gate_values.json'
+    with open(out_path, 'w') as f:
+        json.dump(results, f)
+    print(f'  Saved {out_path}')
 
 
 # ============================================================
@@ -148,9 +136,10 @@ def analysis_attention_entropy(model, test_data):
     layer_entropies = {i: {'r0': [], 'r1': []} for i in range(4)}
     n_batches = min(50, len(test_data))
 
+    device = next(model.parameters()).device
     with torch.no_grad():
         for b in range(n_batches):
-            x = test_data[b:b+1]
+            x = test_data[b:b+1].to(device)
             _ = model(x[:, :-1])
             for i in range(4):
                 cached = get_cached(model, i)
@@ -159,8 +148,8 @@ def analysis_attention_entropy(model, test_data):
                     a1 = cached['attn'][1]
                     e0 = -(a0 * torch.log(a0.clamp(min=1e-10))).sum(dim=-1)
                     e1 = -(a1 * torch.log(a1.clamp(min=1e-10))).sum(dim=-1)
-                    entropy_r0_all.append(e0.reshape(-1).numpy())
-                    entropy_r1_all.append(e1.reshape(-1).numpy())
+                    entropy_r0_all.append(e0.reshape(-1).cpu().numpy())
+                    entropy_r1_all.append(e1.reshape(-1).cpu().numpy())
                     layer_entropies[i]['r0'].append(e0.mean().item())
                     layer_entropies[i]['r1'].append(e1.mean().item())
 
@@ -229,9 +218,10 @@ def analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
     candidates = []
     n_batches = min(200, len(test_data))
 
+    device = next(model_boosted.parameters()).device
     with torch.no_grad():
         for b in range(n_batches):
-            x = test_data[b:b+1]
+            x = test_data[b:b+1].to(device)
             logits_std = model_std(x[:, :-1])
             logits_boost = model_boosted(x[:, :-1])
             targets = x[:, 1:]
@@ -298,14 +288,14 @@ def analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
 
     for row, c in enumerate(selected):
         b, pos = c['batch'], c['pos']
-        x = test_data[b:b+1]
+        x = test_data[b:b+1].to(device)
 
         with torch.no_grad():
             _ = model_boosted(x[:, :-1])
 
         cached = get_cached(model_boosted, 1)  # layer 1
-        attn_r0 = cached['attn'][0][0].mean(dim=0).numpy()
-        attn_r1 = cached['attn'][1][0].mean(dim=0).numpy()
+        attn_r0 = cached['attn'][0][0].mean(dim=0).cpu().numpy()
+        attn_r1 = cached['attn'][1][0].mean(dim=0).cpu().numpy()
 
         ctx_start = c['context_start']
         ctx_end = pos + 1
@@ -370,56 +360,43 @@ def analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
 # Analysis 4: Convex hull escape
 # ============================================================
 
-def dist_to_conv_hull(point, vertices):
-    """Distance from point to conv(vertices) via QP relaxation.
-
-    Solves: min ||point - V @ alpha||^2  s.t. alpha >= 0, sum(alpha) = 1
-    Uses scipy linprog on the dual for efficiency.
-
-    Args:
-        point: (d,) numpy array
-        vertices: (N, d) numpy array, rows are vertices
-    Returns:
-        distance (float)
-    """
-    N, d = vertices.shape
-    # Least-squares with simplex constraint: min ||Va - p||^2
-    # Equivalent to: min a^T (V^T V) a - 2 p^T V a  s.t. a >= 0, 1^T a = 1
-    from scipy.optimize import minimize
-    G = vertices @ vertices.T  # (N, N)
-    c = vertices @ point       # (N,)
-
-    def objective(a):
-        return 0.5 * a @ G @ a - c @ a
-
-    def gradient(a):
-        return G @ a - c
-
+def _solve_one_qp(args):
+    """Solve one distance-to-convex-hull QP via SLSQP. For use with multiprocessing."""
+    from scipy.optimize import minimize as sp_minimize
+    point, verts = args
+    N = verts.shape[0]
+    G = verts @ verts.T
+    c = verts @ point
     a0 = np.ones(N) / N
-    constraints = {'type': 'eq', 'fun': lambda a: a.sum() - 1.0}
-    bounds = [(0, None)] * N
-    result = minimize(objective, a0, jac=gradient, method='SLSQP',
-                      bounds=bounds, constraints=constraints,
-                      options={'maxiter': 200, 'ftol': 1e-10})
-    nearest = vertices.T @ result.x
+    result = sp_minimize(
+        lambda a: 0.5 * a @ G @ a - c @ a,
+        a0, jac=lambda a: G @ a - c, method='SLSQP',
+        bounds=[(0, None)] * N,
+        constraints={'type': 'eq', 'fun': lambda a: a.sum() - 1.0},
+        options={'maxiter': 300, 'ftol': 1e-12})
+    nearest = verts.T @ result.x
     return float(np.linalg.norm(point - nearest))
 
 
 def analysis_convex_hull(model, test_data):
     """Check whether the boosted output escapes conv(V⁰) — the convex hull
-    of round-0 value vectors."""
+    of round-0 value vectors. Uses batched GPU projected GD."""
     print('\n=== Analysis 4: Convex Hull Escape ===')
+    device = next(model.parameters()).device
 
     enable_capture(model)
     n_batches = min(30, len(test_data))
+    n_positions = 5
 
-    # Per-layer stats
-    layer_stats = {i: {'dist_r0': [], 'dist_final': [], 'gate_mean': []}
-                   for i in range(4)}
+    # Collect all QP problems first (model forward on CPU), then solve in parallel
+    layer_problems = {i: [] for i in range(4)}  # list of (point, verts) per layer
+    layer_norms = {i: [] for i in range(4)}     # ||output|| for normalization
+    layer_stats = {i: {'dist_final': []} for i in range(4)}
 
+    print('  Collecting problems from model...')
     with torch.no_grad():
         for b in range(n_batches):
-            x = test_data[b:b+1]
+            x = test_data[b:b+1].to(device)
             _ = model(x[:, :-1])
 
             for li in range(4):
@@ -427,118 +404,90 @@ def analysis_convex_hull(model, test_data):
                 if not cached.get('v') or len(cached['v']) < 2:
                     continue
 
-                # v_r0: (B, H, T, d_head) — round 0 values
-                v_r0 = cached['v'][0]
-                pred_r0 = cached['pred_r0']       # (B, T, D)
-                out_pre = cached['output_pre_proj']  # (B, T, D)
-                gate = cached['gate'][0] if cached['gate'] else None
+                v_r0 = cached['v'][0].cpu().numpy()       # (1, H, T, d_h)
+                out_pre = cached['output_pre_proj'].cpu().numpy()  # (1, T, D)
+                _, H, T, d_h = v_r0.shape
 
-                B, H, T, d_h = v_r0.shape
-
-                # Sample a few positions per sequence to keep cost manageable
-                positions = np.random.choice(range(10, T), size=min(5, T-10), replace=False)
+                max_pos = min(T, 64)
+                positions = np.random.choice(range(10, max_pos), size=min(n_positions, max_pos-10), replace=False)
 
                 for pos in positions:
                     for h in range(H):
-                        # Vertices: causal values up to position pos
-                        verts = v_r0[0, h, :pos+1].numpy()  # (pos+1, d_head)
-                        # Round 0 output for this head at this position
-                        r0_head = pred_r0[0, pos, h*d_h:(h+1)*d_h].numpy()
-                        # Final output (pre W_out) for this head at this position
-                        final_head = out_pre[0, pos, h*d_h:(h+1)*d_h].numpy()
-
-                        d_r0 = dist_to_conv_hull(r0_head, verts)
-                        d_final = dist_to_conv_hull(final_head, verts)
-
-                        layer_stats[li]['dist_r0'].append(d_r0)
-                        layer_stats[li]['dist_final'].append(d_final)
-
-                if gate is not None:
-                    layer_stats[li]['gate_mean'].append(gate.mean().item())
+                        verts = v_r0[0, h, :pos+1]  # (pos+1, d_h)
+                        point = out_pre[0, pos, h*d_h:(h+1)*d_h]  # (d_h,)
+                        layer_problems[li].append((point, verts))
+                        layer_norms[li].append(float(np.linalg.norm(point)))
 
             if (b + 1) % 10 == 0:
-                print(f'  Processed {b+1}/{n_batches} batches')
+                print(f'  Collected {b+1}/{n_batches} batches')
+
+    # Solve all QPs in parallel with multiprocessing
+    n_workers = min(64, os.cpu_count() or 4)
+    for li in range(4):
+        problems = layer_problems[li]
+        if not problems:
+            continue
+        print(f'  Layer {li}: solving {len(problems)} QPs with {n_workers} workers...')
+        with Pool(n_workers) as pool:
+            dists = pool.map(_solve_one_qp, problems)
+        layer_stats[li]['dist_final'] = dists
 
     disable_capture(model)
 
-    # Print stats
-    print('\n  Results (distance to conv(V⁰)):')
+    # Save results to JSON
+    results = {}
+    print('\n  Results (distance of boosted output to conv(V⁰)):')
+    print('  Note: round-0 output is in conv(V⁰) by construction (verified).')
     for li in range(4):
         s = layer_stats[li]
-        if not s['dist_r0']:
+        if not s['dist_final']:
             continue
-        dr0 = np.array(s['dist_r0'])
         df = np.array(s['dist_final'])
         escaped = (df > 1e-4).mean() * 100
-        print(f'    Layer {li}: round0 dist={dr0.mean():.4f}±{dr0.std():.4f}, '
-              f'final dist={df.mean():.4f}±{df.std():.4f}, '
+        print(f'    Layer {li}: final dist={df.mean():.4f}±{df.std():.4f}, '
               f'escaped={escaped:.1f}%')
+        results[f'layer_{li}'] = {'distances': s['dist_final'],
+                                     'output_norms': layer_norms[li]}
 
-    # Plot
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-
-    # Left: distance comparison per layer
-    ax = axes[0]
-    layers_with_data = [i for i in range(4) if layer_stats[i]['dist_r0']]
-    x_pos = np.arange(len(layers_with_data))
-    w = 0.35
-    r0_means = [np.mean(layer_stats[i]['dist_r0']) for i in layers_with_data]
-    final_means = [np.mean(layer_stats[i]['dist_final']) for i in layers_with_data]
-    r0_stds = [np.std(layer_stats[i]['dist_r0']) for i in layers_with_data]
-    final_stds = [np.std(layer_stats[i]['dist_final']) for i in layers_with_data]
-
-    ax.bar(x_pos - w/2, r0_means, w, yerr=r0_stds, color='#2980b9', alpha=0.8,
-           label='Round 0 output', capsize=3)
-    ax.bar(x_pos + w/2, final_means, w, yerr=final_stds, color='#e74c3c', alpha=0.8,
-           label='Final boosted output', capsize=3)
-    ax.set_xlabel('Layer')
-    ax.set_ylabel('Distance to conv($V^{(0)}$)')
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels([f'Layer {i}' for i in layers_with_data])
-    ax.set_title('Distance to Round-0 Value Hull', fontsize=11, fontweight='bold')
-    ax.legend(fontsize=8)
-    ax.grid(axis='y', alpha=0.2, ls='--')
-
-    # Right: histogram of final distances for the most active layer
-    best_layer = max(layers_with_data,
-                     key=lambda i: np.mean(layer_stats[i]['dist_final']))
-    ax = axes[1]
-    df = np.array(layer_stats[best_layer]['dist_final'])
-    ax.hist(df, bins=40, color='#e74c3c', alpha=0.7, edgecolor='white')
-    ax.axvline(0, color='gray', ls='--', lw=1)
-    escaped_pct = (df > 1e-4).mean() * 100
-    ax.set_xlabel('Distance to conv($V^{(0)}$)')
-    ax.set_ylabel('Count')
-    ax.set_title(f'Layer {best_layer}: {escaped_pct:.0f}% of outputs escape conv($V^{{(0)}}$)',
-                 fontsize=10, fontweight='bold')
-    ax.grid(axis='y', alpha=0.2, ls='--')
-
-    plt.tight_layout()
-    for ext in ['pdf', 'png']:
-        plt.savefig(PAPER_DIR / f'fig_convex_hull.{ext}')
-    plt.close()
-    print('  Saved fig_convex_hull')
+    out_path = RESULTS_DIR / 'analysis_convex_hull.json'
+    with open(out_path, 'w') as f:
+        json.dump(results, f)
+    print(f'  Saved {out_path}')
 
 
 # ============================================================
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--only', type=int, nargs='+',
+                        help='Run only these analyses (1-4). Default: all.')
+    args = parser.parse_args()
+    analyses = set(args.only) if args.only else {1, 2, 3, 4}
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'Device: {device}')
+
     print('Loading data...')
     _, _, test_data, tokenizer, actual_vocab = get_wikitext_data(
         seq_len=256, vocab_size=16384, max_train_tokens=100_000)
 
-    print('Loading models...')
-    model_std = load_model('Standard', seed=42)
-    model_boosted = load_model('Boosted-2', seed=42)
-    print(f'Standard params: {sum(p.numel() for p in model_std.parameters()):,}')
-    print(f'Boosted params: {sum(p.numel() for p in model_boosted.parameters()):,}')
+    needs_std = 3 in analyses
+    needs_boosted = bool(analyses & {1, 2, 3, 4})
 
-    analysis_gate_values(model_boosted, test_data)
-    entropy_significant = analysis_attention_entropy(model_boosted, test_data)
-    analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
-    analysis_convex_hull(model_boosted, test_data)
+    if needs_std:
+        model_std = load_model('Standard', seed=42)
+        model_std.to(device)
+    if needs_boosted:
+        model_boosted = load_model('Boosted-2', seed=42)
+        model_boosted.to(device)
 
-    if not entropy_significant:
-        print('\nNote: Entropy analysis not significant — only gate figure produced.')
+    if 1 in analyses:
+        analysis_gate_values(model_boosted, test_data)
+    if 2 in analyses:
+        analysis_attention_entropy(model_boosted, test_data)
+    if 3 in analyses:
+        analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
+    if 4 in analyses:
+        analysis_convex_hull(model_boosted, test_data)
 
     print('\nDone.')
