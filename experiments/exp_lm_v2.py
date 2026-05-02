@@ -34,24 +34,109 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 # Data
 # ============================================================
 
-def get_wikitext_data(seq_len=256, vocab_size=16384, max_train_tokens=None):
-    """Load WikiText-103 with BPE tokenization."""
-    print('Loading WikiText-103...')
-    ds = load_dataset('wikitext', 'wikitext-103-raw-v1', trust_remote_code=True)
+def _get_openwebtext_data(seq_len=256, vocab_size=16384, max_train_tokens=None):
+    """Load OpenWebText via streaming, create val/test from held-out docs."""
+    from itertools import islice
+    stream = load_dataset('openwebtext', split='train', streaming=True)
+
+    max_t = max_train_tokens or 10_000_000
+    target_chars = max_t * 5  # rough chars-to-tokens ratio
+    extra = target_chars // 4  # for val + test
+
+    print(f'  Streaming ~{(target_chars + extra)//1_000_000}M chars...')
+    texts = []
+    char_count = 0
+    for doc in stream:
+        t = doc['text']
+        if len(t.strip()) < 20:
+            continue
+        texts.append(t)
+        char_count += len(t)
+        if char_count >= target_chars + extra:
+            break
+    print(f'  Collected {len(texts)} docs, {char_count:,} chars')
+
+    # Split: last 20% of docs for val/test
+    split_idx = int(len(texts) * 0.8)
+    val_test_split = int(len(texts) * 0.9)
+    train_texts = texts[:split_idx]
+    val_texts = texts[split_idx:val_test_split]
+    test_texts = texts[val_test_split:]
 
     print(f'Training BPE tokenizer (vocab={vocab_size})...')
     tokenizer = Tokenizer(models.BPE())
     tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
     trainer = trainers.BpeTrainer(
         vocab_size=vocab_size, special_tokens=['<pad>', '<unk>'])
-    texts = [t for t in ds['train']['text'] if len(t.strip()) > 0]
+    tokenizer.train_from_iterator(train_texts[:100000], trainer)
+    actual_vocab = tokenizer.get_vocab_size()
+    print(f'Actual vocab size: {actual_vocab}')
+
+    def encode_texts(text_list, max_tokens=None):
+        all_ids = []
+        for t in text_list:
+            all_ids.extend(tokenizer.encode(t).ids)
+            if max_tokens and len(all_ids) >= max_tokens:
+                all_ids = all_ids[:max_tokens]
+                break
+        return torch.tensor(all_ids, dtype=torch.long)
+
+    train_ids = encode_texts(train_texts, max_tokens=max_train_tokens)
+    val_ids = encode_texts(val_texts, max_tokens=1_000_000)
+    test_ids = encode_texts(test_texts, max_tokens=1_000_000)
+
+    def batchify(ids, sl):
+        n = len(ids) // sl
+        return ids[:n * sl].reshape(n, sl)
+
+    train_data = batchify(train_ids, seq_len)
+    val_data = batchify(val_ids, seq_len)
+    test_data = batchify(test_ids, seq_len)
+    print(f'Train: {len(train_data)*seq_len:,} tokens, '
+          f'Val: {len(val_data)*seq_len:,}, Test: {len(test_data)*seq_len:,}')
+    return train_data, val_data, test_data, tokenizer, actual_vocab
+
+
+def get_lm_data(dataset='wikitext-103', seq_len=256, vocab_size=16384,
+                max_train_tokens=None):
+    """Load a language modeling dataset with BPE tokenization.
+
+    Supports: 'wikitext-103', 'ptb', 'openwebtext'.
+    """
+    if dataset == 'wikitext-103':
+        print('Loading WikiText-103...')
+        ds = load_dataset('wikitext', 'wikitext-103-raw-v1',
+                          trust_remote_code=True)
+    elif dataset == 'ptb':
+        print('Loading Penn Treebank...')
+        try:
+            ds = load_dataset('ptb_text_only', 'penn_treebank',
+                              trust_remote_code=True)
+        except Exception:
+            ds = load_dataset('ptb-text-only/ptb_text_only',
+                              'penn_treebank', trust_remote_code=True)
+    elif dataset == 'openwebtext':
+        print('Loading OpenWebText (streaming)...')
+        return _get_openwebtext_data(seq_len, vocab_size, max_train_tokens)
+    else:
+        raise ValueError(f'Unknown dataset: {dataset}')
+
+    text_key = 'sentence' if dataset == 'ptb' else 'text'
+    train_split, val_split, test_split = 'train', 'validation', 'test'
+
+    print(f'Training BPE tokenizer (vocab={vocab_size})...')
+    tokenizer = Tokenizer(models.BPE())
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    trainer = trainers.BpeTrainer(
+        vocab_size=vocab_size, special_tokens=['<pad>', '<unk>'])
+    texts = [t for t in ds[train_split][text_key] if len(t.strip()) > 0]
     tokenizer.train_from_iterator(texts[:100000], trainer)
 
     actual_vocab = tokenizer.get_vocab_size()
     print(f'Actual vocab size: {actual_vocab}')
 
     def encode_split(split_name, max_tokens=None):
-        texts = [t for t in ds[split_name]['text'] if len(t.strip()) > 0]
+        texts = [t for t in ds[split_name][text_key] if len(t.strip()) > 0]
         all_ids = []
         for t in texts:
             ids = tokenizer.encode(t).ids
@@ -61,9 +146,9 @@ def get_wikitext_data(seq_len=256, vocab_size=16384, max_train_tokens=None):
                 break
         return torch.tensor(all_ids, dtype=torch.long)
 
-    train_ids = encode_split('train', max_tokens=max_train_tokens)
-    val_ids = encode_split('validation', max_tokens=1_000_000)
-    test_ids = encode_split('test', max_tokens=1_000_000)
+    train_ids = encode_split(train_split, max_tokens=max_train_tokens)
+    val_ids = encode_split(val_split, max_tokens=1_000_000)
+    test_ids = encode_split(test_split, max_tokens=1_000_000)
 
     def batchify(ids, seq_len):
         n = len(ids) // seq_len
@@ -77,14 +162,20 @@ def get_wikitext_data(seq_len=256, vocab_size=16384, max_train_tokens=None):
     return train_data, val_data, test_data, tokenizer, actual_vocab
 
 
+def get_wikitext_data(seq_len=256, vocab_size=16384, max_train_tokens=None):
+    return get_lm_data('wikitext-103', seq_len, vocab_size, max_train_tokens)
+
+
 # ============================================================
 # Transformer LM
 # ============================================================
 
 class TransformerLM(nn.Module):
     def __init__(self, vocab_size, d_model, n_layers, n_heads, max_seq=256,
-                 attn_type='standard', n_rounds=2, dropout=0.1):
+                 attn_type='standard', n_rounds=2, dropout=0.1,
+                 ln_type='pre'):
         super().__init__()
+        self.ln_type = ln_type
         self.embed = nn.Embedding(vocab_size, d_model)
         self.pos_embed = nn.Embedding(max_seq, d_model)
         self.drop = nn.Dropout(dropout)
@@ -125,9 +216,14 @@ class TransformerLM(nn.Module):
     def forward(self, x):
         B, T = x.shape
         h = self.drop(self.embed(x) + self.pos_embed(torch.arange(T, device=x.device)))
-        for layer in self.layers:
-            h = h + layer['attn'](layer['n1'](h))
-            h = h + layer['ffn'](layer['n2'](h))
+        if self.ln_type == 'pre':
+            for layer in self.layers:
+                h = h + layer['attn'](layer['n1'](h))
+                h = h + layer['ffn'](layer['n2'](h))
+        else:
+            for layer in self.layers:
+                h = layer['n1'](h + layer['attn'](h))
+                h = layer['n2'](h + layer['ffn'](h))
         return self.head(self.ln_f(h))
 
 
@@ -280,18 +376,23 @@ if __name__ == '__main__':
     parser.add_argument('--seeds', type=int, nargs='+', default=[42, 123])
     parser.add_argument('--attn', type=str, nargs='+', default=None,
                         help='Only run these attention types (e.g. --attn boosted)')
+    parser.add_argument('--dataset', default='wikitext-103',
+                        choices=['wikitext-103', 'ptb', 'openwebtext'])
+    parser.add_argument('--ln_type', default='pre', choices=['pre', 'post'])
     parser.add_argument('--dry', action='store_true', help='Print configs and exit')
     args = parser.parse_args()
 
     scales = list(SCALES.keys()) if args.scale == 'all' else [args.scale]
+    ds_tag = args.dataset.replace('-', '')
+    ln_tag = f'_{args.ln_type}ln' if args.ln_type != 'pre' else ''
 
     t0 = time.time()
     seq_len = 256
 
     # Determine max tokens needed
     max_tokens = max(SCALES[s]['max_train_tokens'] for s in scales)
-    train_data, val_data, test_data, tokenizer, actual_vocab = get_wikitext_data(
-        seq_len, vocab_size=16384, max_train_tokens=max_tokens)
+    train_data, val_data, test_data, tokenizer, actual_vocab = get_lm_data(
+        args.dataset, seq_len, vocab_size=16384, max_train_tokens=max_tokens)
 
     all_results = {}
 
@@ -351,10 +452,10 @@ if __name__ == '__main__':
 
                 model = TransformerLM(
                     actual_vocab, d_model, n_layers, n_heads,
-                    seq_len, attn_type, n_rounds)
+                    seq_len, attn_type, n_rounds, ln_type=args.ln_type)
 
                 # Save checkpoint for future downstream eval
-                ckpt_name = f'{label.replace("/", "_")}_seed{seed}.pt'
+                ckpt_name = f'{ds_tag}{ln_tag}_{label.replace("/", "_")}_seed{seed}.pt'
                 ckpt_path = RESULTS_DIR / 'checkpoints' / ckpt_name
 
                 history, n_params, test_ppl = train_lm(
@@ -401,7 +502,7 @@ if __name__ == '__main__':
 
         # Save
         summary = {k: v for k, v in all_results.items()}
-        outfile = RESULTS_DIR / f'exp_v2_{"_".join(scales)}.json'
+        outfile = RESULTS_DIR / f'exp_v2_{ds_tag}_{"_".join(scales)}{ln_tag}.json'
         with open(outfile, 'w') as f:
             json.dump(summary, f, indent=2)
         print(f'Saved: {outfile}')

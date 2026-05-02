@@ -1,0 +1,48 @@
+{
+  "0-1": {
+    "n_tokens": 24,
+    "mean_improvement": -0.23572729527950287,
+    "mean_loss_std": 13.276329040527344,
+    "mean_loss_boost": 13.512055397033691,
+    "relative_improvement_pct": -1.7755457443086966
+  },
+  "2-10": {
+    "n_tokens": 76,
+    "mean_improvement": 0.17842799425125122,
+    "mean_loss_std": 10.523134231567383,
+    "mean_loss_boost": 10.344705581665039,
+    "relative_improvement_pct": 1.6955784305782349
+  },
+  "11-100": {
+    "n_tokens": 6163,
+    "mean_improvement": 0.11450174450874329,
+    "mean_loss_std": 7.170456409454346,
+    "mean_loss_boost": 7.055954933166504,
+    "relative_improvement_pct": 1.5968543419045287
+  },
+  "101-1k": {
+    "n_tokens": 80009,
+    "mean_improvement": 0.08633238077163696,
+    "mean_loss_std": 6.315372943878174,
+    "mean_loss_boost": 6.229040622711182,
+    "relative_improvement_pct": 1.3670195179102371
+  },
+  "1k-10k": {
+    "n_tokens": 82535,
+    "mean_improvement": 0.06275976449251175,
+    "mean_loss_std": 4.844114780426025,
+    "mean_loss_boost": 4.7813544273376465,
+    "relative_improvement_pct": 1.2955878904048639
+  },
+  "10k+": {
+    "n_tokens": 118578,
+    "mean_improvement": 0.05287930369377136,
+    "mean_loss_std": 2.366154670715332,
+    "mean_loss_boost": 2.3132753372192383,
+    "relative_improvement_pct": 2.23482024857593
+  },
+  "overall": {
+    "mean_improvement": 0.0663609579205513,
+    "correlation_logfreq_improvement": -0.022202068581639797
+  }
+}
