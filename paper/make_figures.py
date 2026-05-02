@@ -192,13 +192,13 @@ def fig_results():
     # ---- Right: ablation rounds ----
     ax = ax2
     rounds = [1, 2, 3, 4, 5]
-    accs = [41.3, 53.3, 54.8, 56.3, 55.8]
+    accs = [41.3, 54.8, 55.1, 56.4, 55.8]
 
     ax.plot(rounds, accs, 'o-', color=C_BOOST, lw=2.5, ms=8, zorder=3)
     ax.fill_between(rounds, 38, accs, alpha=0.08, color=C_BOOST)
     ax.axhline(41.3, color=C_STD, ls='--', lw=1, alpha=0.6, label='1-round baseline')
 
-    ax.annotate('+12 pp', xy=(1.55, 47.5), fontsize=9, fontweight='bold', color=C_BOOST)
+    ax.annotate('+13.5 pp', xy=(1.55, 47.5), fontsize=9, fontweight='bold', color=C_BOOST)
 
     ax.set_xlabel('Boosting Rounds ($M$)')
     ax.set_ylabel('Retrieval Accuracy (%)')
@@ -314,6 +314,59 @@ def fig_convex_hull():
 
 
 # ============================================================
+# Figure 5: Scaling ablation across (d, K, sigma) configs
+# ============================================================
+
+def fig_scaling_ablation():
+    with open(RESULTS_DIR / 'exp_ablations.json') as f:
+        data = json.load(f)
+
+    configs = data['ablation_configs']
+
+    dims = [32, 64, 128]
+    dim_configs = {d: {} for d in dims}
+    for key, val in configs.items():
+        for d in dims:
+            if key.startswith(f'd={d},'):
+                sigma = float(key.split('s=')[1])
+                dim_configs[d][sigma] = val
+
+    fig, axes = plt.subplots(1, 3, figsize=(11, 3.2), sharey=True)
+    for ax, d in zip(axes, dims):
+        sigmas = sorted(dim_configs[d].keys())
+        deltas = [dim_configs[d][s]['delta'] for s in sigmas]
+        baselines = [dim_configs[d][s]['baseline'] for s in sigmas]
+        boosteds = [dim_configs[d][s]['boosted'] for s in sigmas]
+
+        for key in configs:
+            if key.startswith(f'd={d},'):
+                K_val = int(key.split('K=')[1].split(',')[0])
+                break
+
+        x = np.arange(len(sigmas))
+        w = 0.35
+        bars_b = ax.bar(x - w/2, baselines, w, label='Standard', color=C_STD, alpha=0.8)
+        bars_bo = ax.bar(x + w/2, boosteds, w, label='Boosted', color=C_BOOST, alpha=0.8)
+
+        for i, delta in enumerate(deltas):
+            y_top = max(baselines[i], boosteds[i])
+            ax.text(x[i] + w/2, y_top + 1.0, f'+{delta:.1f}',
+                    ha='center', va='bottom', fontsize=7, fontweight='bold',
+                    color=C_BOOST)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([f'$\\sigma$={s}' for s in sigmas], fontsize=8)
+        ax.set_title(f'$d$={d}, $K$={K_val}', fontsize=10, fontweight='bold')
+        ax.grid(axis='y', alpha=0.2, ls='--')
+        if ax == axes[0]:
+            ax.set_ylabel('Retrieval Accuracy (%)', fontsize=9)
+            ax.legend(fontsize=8, loc='upper right')
+
+    plt.tight_layout()
+    _save('fig_scaling_ablation')
+
+
+# ============================================================
 
 if __name__ == '__main__':
     fig_architecture()
@@ -322,4 +375,6 @@ if __name__ == '__main__':
         fig_gate_analysis()
     if (RESULTS_DIR / 'analysis_convex_hull.json').exists():
         fig_convex_hull()
+    if (RESULTS_DIR / 'exp_ablations.json').exists():
+        fig_scaling_ablation()
     print('\nAll figures generated.')

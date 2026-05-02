@@ -44,7 +44,8 @@ We introduce \emph{gradient-boosted attention}, which applies the principle of g
 Under a squared reconstruction objective, the construction maps onto Friedman's gradient boosting machine, with each attention pass as a base learner and the per-dimension gate as the shrinkage parameter.
 We show that a single Hopfield-style update erases all query information orthogonal to the stored-pattern subspace, and that further iteration under local contraction can collapse distinct queries in the same region to the same fixed point.
 We also show that separate projections for the correction pass can recover residual information inaccessible to the shared-projection approach of Tukey's twicing.
-On a 10M-token subset of WikiText-103, gradient-boosted attention achieves a test perplexity of $67.9$ compared to $72.2$ for standard attention, $69.6$ for Twicing Attention, and $69.0$ for a parameter-matched wider baseline, with two rounds capturing most of the benefit.
+On 10M-token subsets of WikiText-103 and OpenWebText, gradient-boosted attention improves test perplexity by $6.0\%$ and $5.6\%$ over standard attention, outperforming both Twicing Attention and a parameter-matched wider baseline on both benchmarks, with two rounds capturing most of the benefit.
+We further show, both theoretically and empirically, that the mechanism requires the additive residual structure of Pre-LN transformers: under Post-LN, the same architecture degrades perplexity by $9.6\%$.
 \end{abstract}
 
 
@@ -92,7 +93,9 @@ We discuss these and other related works in detail in Section~\ref{sec:related}.
 
     \item We show that a single attention step discards all query information orthogonal to the stored patterns (Proposition~\ref{prop:erasure}), establish a formal correspondence to Friedman's gradient boosting under a reconstruction objective (Proposition~\ref{prop:mart}), and show that separate projections applied to the residual can both attend to different tokens and produce values in a different subspace than the first round, escaping the convex hull of the original value vectors (Proposition~\ref{prop:separate}).
 
-    \item On a 10M-token subset of WikiText-103, gradient-boosted attention improves test perplexity by $6.0\%$ relative over standard attention, outperforms Twicing Attention by $1.7$ points, and improves $1.1$ points over a parameter-matched wider baseline, with ablations confirming that two rounds capture most of the benefit.
+    \item We show that Post-LN placement disrupts the additive structure required by gradient boosting: the well-known rank-$(d{-}2)$ LayerNorm Jacobian \citep{xiong2020layer} couples dimensions and rescales corrections by a data-dependent factor, breaking the element-wise gate control (Proposition~\ref{prop:normalization}). Empirically, gradient-boosted attention improves perplexity by $6.0\%$ under Pre-LN but degrades it by $9.6\%$ under Post-LN, while a parameter-matched wider baseline improves under both placements.
+
+    \item On 10M-token subsets of WikiText-103 and OpenWebText, gradient-boosted attention improves test perplexity by $6.0\%$ and $5.6\%$ over standard attention, outperforming Twicing Attention and a parameter-matched wider baseline on both benchmarks, with two rounds capturing most of the benefit.
 \end{enumerate}
 
 
@@ -122,7 +125,7 @@ Given stored patterns $\mathbf{X} = [\mathbf{x}_1, \ldots, \mathbf{x}_N] \in \ma
     T(\boldsymbol{\xi}) = \mathbf{X} \, \mathrm{softmax}(\beta \mathbf{X}^\top \boldsymbol{\xi}),
 \end{equation}
 where $\beta > 0$ is the inverse temperature.
-Setting $\beta = 1/\sqrt{d_k}$ and allowing separate key/value projections recovers standard attention.
+Setting $\beta = 1/\sqrt{d_h}$ (the per-head dimension) and allowing separate key/value projections recovers standard attention.
 The associated energy function is
 \begin{equation}
 \label{eq:energy}
@@ -154,7 +157,7 @@ Let $\mathbf{x} \in \mathbb{R}^{B \times T \times d}$ denote the input to an att
 All three projections are applied to the same input $\mathbf{z}$: the original input $\mathbf{x}$ for round~0, and the current residual $\mathbf{r}_m$ for rounds $m \geq 1$.
 Each correction round thus operates in its own subspace of the residual, with keys and values that reflect what has \emph{not yet been predicted} rather than the original context.
 
-The forward pass (Algorithm~\ref{alg:boosted}) proceeds as follows:
+Algorithm~\ref{alg:boosted} summarizes the forward pass.
 \begin{algorithm}[t]
 \caption{Gradient-Boosted Attention Forward Pass}
 \label{alg:boosted}
@@ -180,8 +183,8 @@ We verify in our ablations (Section~\ref{sec:ablations}) that all gate variants 
 
 \paragraph{Computational cost.}
 With $M$ rounds, the attention computation is approximately $M$ times the cost of standard attention, plus a small gating network.
-In practice, $M = 2$ adds approximately 18\% parameters and ${\sim}50\%$ attention FLOPs; however, since attention is only one component of each transformer block (alongside the FFN), the end-to-end wall-clock increase is approximately 20\% per training step.
-By contrast, Twicing Attention \citep{abdullaev2025twicing} adds zero parameters and ${\sim}7\%$ total compute, since it reuses the same attention matrix.
+In practice, $M = 2$ adds approximately 18\% total parameters.
+By contrast, Twicing Attention \citep{abdullaev2025twicing} adds zero parameters, since it reuses the same attention matrix.
 Our additional cost buys separate projections for the correction pass, which Proposition~\ref{prop:separate} shows can recover information inaccessible to shared-kernel correction.
 We show in Section~\ref{sec:experiments} that the improvement cannot be replicated by simply widening the standard model to match the parameter count.
 
@@ -314,6 +317,60 @@ Since $\mathbf{V}' = \mathbf{W}_V^{(1)} \mathbf{r}$ and $\mathbf{V} = \mathbf{W}
 \end{proof}
 
 
+\subsection{Normalization Placement and the Additive Structure}
+\label{sec:normalization}
+
+Gradient boosting builds an additive model: the cumulative prediction $F_M = F_0 + \sum_{m=1}^{M} \eta_m f_m$ must preserve each correction term without distortion.
+The LayerNorm Jacobian and its properties are well established \citep{xiong2020layer}; we restate the relevant facts here to make explicit their consequence for gradient-boosted attention.
+Pre-LN and Post-LN differ fundamentally in whether they preserve the additive structure across layers.
+
+\begin{proposition}[Normalization placement and additive preservation]
+\label{prop:normalization}
+Consider a transformer layer with sublayer output $\mathbf{f} \in \mathbb{R}^d$ (e.g., the output of gradient-boosted attention).
+\begin{enumerate}
+    \item[(a)] Under Pre-LN placement, $\mathbf{h}_{l+1} = \mathbf{h}_l + \mathbf{f}(\mathrm{LN}(\mathbf{h}_l))$.
+    The Jacobian of $\mathbf{h}_{l+1}$ with respect to the sublayer output $\mathbf{f}$ is the identity:
+    \begin{equation}
+    \frac{\partial \mathbf{h}_{l+1}}{\partial \mathbf{f}} = \mathbf{I}.
+    \end{equation}
+    Each component of $\mathbf{f}$---including any gated correction $\mathbf{g}_m \odot \mathbf{c}_m$---contributes independently and without distortion to the residual stream.
+
+    \item[(b)] Under Post-LN placement, $\mathbf{h}_{l+1} = \mathrm{LN}(\mathbf{h}_l + \mathbf{f}(\mathbf{h}_l))$.
+    Let $\mathbf{u} = \mathbf{h}_l + \mathbf{f}$, $\mu = \frac{1}{d}\sum_j u_j$, $\sigma^2 = \frac{1}{d}\sum_j (u_j - \mu)^2$, and $\hat{\mathbf{u}} = (\mathbf{u} - \mu\mathbf{1})/\sigma$.
+    The Jacobian of $\mathbf{h}_{l+1}$ with respect to $\mathbf{f}$ is the well-known LayerNorm Jacobian \citep{xiong2020layer}:
+    \begin{equation}
+    \label{eq:ln_jacobian}
+    \frac{\partial \mathbf{h}_{l+1}}{\partial \mathbf{f}} = \frac{\mathrm{diag}(\boldsymbol{\gamma})}{\sigma}\left(\mathbf{I} - \frac{1}{d}\mathbf{1}\mathbf{1}^\top - \frac{1}{d}\hat{\mathbf{u}}\hat{\mathbf{u}}^\top\right),
+    \end{equation}
+    where $\boldsymbol{\gamma} \in \mathbb{R}^d$ is the learned scale parameter of LayerNorm.
+    This matrix has rank $d - 2$: it annihilates the constant vector $\mathbf{1}$ and the standardized activation $\hat{\mathbf{u}}$, and it couples all surviving dimensions through the outer-product terms.
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}
+(a) Since $\mathbf{h}_{l+1} = \mathbf{h}_l + \mathbf{f}$ and $\mathbf{h}_l$ does not depend on $\mathbf{f}$, the Jacobian is immediate.
+
+(b) The $i$-th component of $\mathrm{LN}(\mathbf{u})$ is $\gamma_i(u_i - \mu)/\sigma + \beta_i$.
+Using $\partial \mu / \partial u_j = 1/d$ and $\partial \sigma / \partial u_j = (u_j - \mu)/(d\sigma)$:
+\[
+\frac{\partial [\mathrm{LN}(\mathbf{u})]_i}{\partial u_j} = \frac{\gamma_i}{\sigma}\left(\delta_{ij} - \frac{1}{d} - \frac{\hat{u}_i \hat{u}_j}{d}\right).
+\]
+Since $\mathbf{u} = \mathbf{h}_l + \mathbf{f}$ with $\partial u_j / \partial f_j = 1$, this gives equation~(\ref{eq:ln_jacobian}).
+For the rank: $\hat{\mathbf{u}}$ is centered ($\mathbf{1}^\top \hat{\mathbf{u}} = 0$), so $\mathbf{1}$ and $\hat{\mathbf{u}}$ are linearly independent.
+Both are null vectors of $\mathbf{I} - \frac{1}{d}\mathbf{1}\mathbf{1}^\top - \frac{1}{d}\hat{\mathbf{u}}\hat{\mathbf{u}}^\top$ (using $\|\hat{\mathbf{u}}\|^2 = d$), and any $\mathbf{v} \perp \{\mathbf{1}, \hat{\mathbf{u}}\}$ satisfies $(\mathbf{I} - \frac{1}{d}\mathbf{1}\mathbf{1}^\top - \frac{1}{d}\hat{\mathbf{u}}\hat{\mathbf{u}}^\top)\mathbf{v} = \mathbf{v}$, giving rank exactly $d - 2$. \qed
+\end{proof}
+
+\begin{remark}
+\label{rem:normalization}
+Under Pre-LN, Proposition~\ref{prop:normalization}(a) ensures that the gated boosting correction $\mathbf{g}_m \odot \mathbf{c}_m$ from Algorithm~\ref{alg:boosted} enters the residual stream unchanged, preserving the additive structure $F_m = F_{m-1} + \mathbf{g}_m \odot \mathbf{c}_m$ that the MART correspondence (Proposition~\ref{prop:mart}) requires.
+More broadly, the residual stream after $L$ Pre-LN layers decomposes as $\mathbf{h}_L = \mathbf{h}_0 + \sum_{l} \mathbf{f}_l$, matching the additive form of gradient boosting across layers \citep{cheng2024transformers}.
+Under Post-LN, the rank-$(d{-}2)$ Jacobian projects out two degrees of freedom (the mean direction $\mathbf{1}$ and the variance-aligned direction $\hat{\mathbf{u}}$), rescales the remainder by the data-dependent factor $\boldsymbol{\gamma}/\sigma$, and introduces cross-dimensional coupling through $\hat{\mathbf{u}}\hat{\mathbf{u}}^\top$.
+The per-dimension gate $\mathbf{g}_m$ was learned to apply element-wise shrinkage, but this coupling mixes the corrections across dimensions, undermining the independent per-dimension control.
+We verify empirically in Section~\ref{sec:experiments} that gradient-boosted attention improves perplexity by $6.0\%$ under Pre-LN but \emph{degrades} it by $9.6\%$ under Post-LN.
+This connection is consistent with the identity-mapping principle of \citet{he2016identity}, who showed in ResNets that placing normalization inside the residual branch (preserving a clean additive shortcut) improves both gradient flow and final accuracy---the same structural requirement that gradient boosting imposes.
+\end{remark}
+
+
 % ============================================================
 \section{Why Iterating Attention Fails: Negative Results}
 \label{sec:negative}
@@ -365,39 +422,41 @@ The converged path contains no useful complementary signal.
 \subsection{WikiText-103 Language Modeling}
 
 \paragraph{Setup.}
-We train small transformer language models from scratch on a \textbf{10M-token subset} of WikiText-103 \citep{merity2016pointer} (the full corpus contains ${\sim}103$M tokens) and compare four configurations: (1)~\textbf{Standard} causal multi-head attention with $d = 256$, 4 layers, and 4 heads (7.4M parameters); (2)~\textbf{Twicing} Attention \citep{abdullaev2025twicing} with the same architecture, applying the correction $(2\mathbf{A} - \mathbf{A}^2)\mathbf{V}$ at no additional parameter cost (7.4M parameters); (3)~a \textbf{parameter-fair} standard model with $d = 288$, matching the parameter count of the boosted model (8.8M parameters); and (4)~\textbf{gradient-boosted attention} ($M = 2$) with separate QKV projections per round and a per-dimension sigmoid gate (8.7M parameters).
-
-All models use BPE tokenization (16K vocabulary), sequence length 256, AdamW optimizer with learning rate $3 \times 10^{-4}$, cosine schedule with 1500 warmup steps, weight tying, and gradient clipping at 1.0.
-We train for 15 epochs over the 10M-token training subset and evaluate on the full WikiText-103 test set, reporting perplexity averaged over 2 random seeds.
-All models are trained on a single NVIDIA RTX 2000 Ada (16GB); each run takes approximately 30 minutes.
+We train small transformer language models from scratch and compare four attention configurations: (1)~\textbf{Standard} causal multi-head attention with $d = 256$, 4 layers, and 4 heads (7.4M parameters); (2)~\textbf{Twicing} Attention \citep{abdullaev2025twicing} with the same architecture, applying the correction $(2\mathbf{A} - \mathbf{A}^2)\mathbf{V}$ at no additional parameter cost (7.4M parameters); (3)~a \textbf{parameter-fair} standard model with $d = 288$, matching the parameter count of the boosted model (8.8M parameters); and (4)~\textbf{gradient-boosted attention} ($M = 2$) with separate QKV projections per round and a per-dimension sigmoid gate (8.7M parameters).
+All models use Pre-LN placement \citep{xiong2020layer}, BPE tokenization (16K vocabulary), sequence length 256, AdamW optimizer with learning rate $3 \times 10^{-4}$, cosine schedule with 1500 warmup steps, weight tying, and gradient clipping at 1.0.
+We evaluate on two benchmarks: (i) a \textbf{10M-token subset} of WikiText-103 \citep{merity2016pointer} (the full corpus contains ${\sim}103$M tokens), and (ii) a \textbf{10M-token subset} of OpenWebText \citep{gokaslan2019openwebtext}, an open reproduction of WebText containing Reddit-upvoted web content.
+Each benchmark uses a separately trained BPE tokenizer; perplexity values are comparable only within the same dataset.
+We train for 15 epochs and report test perplexity averaged over 2 random seeds.
 Full hyperparameters are listed in Appendix~\ref{app:hyperparams}.
 
 \paragraph{Results.}
 
 \begin{table}[t]
 \centering
-\caption{WikiText-103 test perplexity (lower is better). Boosted-2 outperforms both the standard baseline and a wider standard model with matched parameter count, confirming the improvement is architectural.}
-\label{tab:wikitext}
-\begin{tabular}{@{}lccc@{}}
+\caption{Test perplexity (lower is better) on two benchmarks. All models use Pre-LN. Perplexity values are not comparable across datasets (different tokenizers). Gradient-boosted attention outperforms all baselines on both benchmarks, including a wider model with matched parameter count.}
+\label{tab:main_results}
+\begin{tabular}{@{}lcccc@{}}
 \toprule
-\textbf{Model} & \textbf{Test PPL} & \textbf{Val PPL} & \textbf{Parameters} \\
+& & \multicolumn{2}{c}{\textbf{Test Perplexity}} & \\
+\cmidrule(lr){3-4}
+\textbf{Model} & \textbf{Params} & \textbf{WikiText-103} & \textbf{OpenWebText} & \textbf{Rel.\ $\Delta$ (WT)} \\
 \midrule
-Standard ($d{=}256$)              & $72.2 \pm 0.3$ & $72.2 \pm 0.4$ & 7,419,392 \\
-Twicing ($d{=}256$)               & $69.6 \pm 0.1$ & $70.3 \pm 0.0$ & 7,419,392 \\
-Standard ($d{=}288$, param-fair)  & $69.0 \pm 0.1$ & $69.6 \pm 0.1$ & 8,789,184 \\
-Gradient-boosted ($d{=}256$, $M{=}2$) & $\mathbf{67.9 \pm 0.1}$ & $\mathbf{68.1 \pm 0.2}$ & 8,734,208 \\
+Standard ($d{=}256$)              & 7.4M & $72.2 \pm 0.3$ & $114.9 \pm 0.5$ & --- \\
+Twicing ($d{=}256$)               & 7.4M & $69.6 \pm 0.1$ & $110.7 \pm 0.3$ & $-3.6\%$ \\
+Standard ($d{=}288$, param-fair)  & 8.8M & $69.0 \pm 0.1$ & $110.2 \pm 0.5$ & $-4.4\%$ \\
+Gradient-boosted ($M{=}2$) & 8.7M & $\mathbf{67.9 \pm 0.1}$ & $\mathbf{108.5 \pm 0.9}$ & $\mathbf{-6.0\%}$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:wikitext} shows the results.
-Gradient-boosted attention achieves a test perplexity of $67.9$, improving over standard attention by $4.3$ points ($6.0\%$ relative).
+Table~\ref{tab:main_results} shows the results.
+On WikiText-103, gradient-boosted attention achieves a test perplexity of $67.9$, improving over standard attention by $4.3$ points ($6.0\%$ relative).
 Three comparisons isolate different contributions.
 Compared with Twicing ($69.6 \to 67.9$, $-1.7$ points), both methods correct the initial attention estimate, but separate projections with a learned gate outperform the fixed shared-kernel correction $(2\mathbf{A} - \mathbf{A}^2)\mathbf{V}$, validating Proposition~\ref{prop:separate}.
 Compared with the parameter-matched wider baseline ($69.0 \to 67.9$, $-1.1$ points), the wider standard model has slightly more parameters ($8.8$M vs $8.7$M) yet lacks the error-correction mechanism; this gap isolates the architectural contribution of residual fitting.
-The total improvement over standard attention ($72.2 \to 67.9$, $-4.3$ points, $6.0\%$ relative) combines both the architectural and capacity effects.
 
-Standard deviations are tight ($\leq 0.3$) across all configurations, confirming that the results are stable across random seeds.
+On OpenWebText, the same pattern holds: gradient-boosted attention achieves $108.5$ vs.\ $114.9$ for standard ($5.6\%$ relative improvement) and $110.2$ for the parameter-fair baseline ($1.5\%$ improvement).
+Standard deviations are tight on both benchmarks, confirming stability across random seeds.
 
 \begin{figure}[t]
 \centering
@@ -407,6 +466,37 @@ Standard deviations are tight ($\leq 0.3$) across all configurations, confirming
 \end{figure}
 
 
+\subsection{Normalization Ablation}
+\label{sec:norm_ablation}
+
+Proposition~\ref{prop:normalization} predicts that Post-LN placement should disrupt gradient-boosted attention by distorting the additive correction through the LayerNorm Jacobian.
+To test this, we retrain three models on WikiText-103 with Post-LN placement ($\mathbf{h}_{l+1} = \mathrm{LN}(\mathbf{h}_l + f(\mathbf{h}_l))$), keeping all other hyperparameters identical (single seed).
+
+\begin{table}[t]
+\centering
+\caption{Effect of normalization placement on WikiText-103 test perplexity. Under Pre-LN, gradient-boosted attention improves over standard by $6.0\%$. Under Post-LN, it degrades by $9.6\%$. The parameter-fair baseline improves under both placements, ruling out a generic optimization difficulty with extra parameters under Post-LN.}
+\label{tab:normalization}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Model} & \textbf{Params} & \textbf{Pre-LN} & \textbf{Post-LN} \\
+\midrule
+Standard ($d{=}256$)              & 7.4M & $72.2$ & $77.2$ \\
+Standard ($d{=}288$, param-fair)  & 8.8M & $69.0$ & $71.8$ \\
+Gradient-boosted ($M{=}2$)       & 8.7M & $\mathbf{67.9}$ & $84.6$ \\
+\midrule
+$\Delta$ Boosted vs.\ Standard   &      & $-6.0\%$ & $+9.6\%$ \\
+$\Delta$ Param-fair vs.\ Standard &     & $-4.4\%$ & $-7.0\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:normalization} shows the results.
+Under Post-LN, gradient-boosted attention degrades perplexity from $77.2$ to $84.6$ ($+9.6\%$), \emph{reversing} the $6.0\%$ improvement observed under Pre-LN.
+The parameter-fair baseline serves as a critical control: with nearly identical parameter count ($8.8$M vs.\ $8.7$M), it \emph{improves} perplexity under Post-LN ($77.2 \to 71.8$, $-7.0\%$), ruling out the hypothesis that extra parameters are generically harder to train under Post-LN.
+The failure is specific to the boosting mechanism: Post-LN's rank-$(d{-}2)$ Jacobian (Proposition~\ref{prop:normalization}(b)) distorts the gated correction before it reaches the next layer, breaking the additive structure that gradient boosting requires.
+This is consistent with the observation of \citet{he2016identity} that pre-activation placement---which preserves a clean identity shortcut---is essential for depth-dependent refinement in residual networks.
+
+
 \subsection{Ablation Studies}
 \label{sec:ablations}
 
@@ -414,8 +504,8 @@ We conduct ablations on the synthetic pattern denoising task ($d = 64$, $K = 16$
 
 \paragraph{Number of boosting rounds.}
 Table~\ref{tab:rounds} shows retrieval accuracy as a function of $M$.
-The jump from 1 to 2 rounds ($+12$ percentage points) accounts for the vast majority of the improvement.
-Additional rounds provide diminishing returns: $+2$ for round 3, $+1$ for round 4.
+The jump from 1 to 2 rounds ($+13.5$ percentage points) accounts for the vast majority of the improvement.
+Additional rounds yield diminishing returns, with accuracy plateauing around $M{=}4$.
 This mirrors the well-known behavior of gradient boosting with strong base learners \citep{friedman2001greedy}, where early rounds capture the dominant signal and later rounds offer marginal gains.
 
 \begin{table}[t]
@@ -426,22 +516,36 @@ This mirrors the well-known behavior of gradient boosting with strong base learn
 \toprule
 \textbf{Rounds ($M$)} & 1 & 2 & 3 & 4 & 5 \\
 \midrule
-Accuracy (\%) & 41.3 & 53.3 & 54.8 & 56.3 & 55.8 \\
-$\Delta$ from $M{=}1$ & --- & +12.0 & +13.5 & +15.0 & +14.5 \\
+Accuracy (\%) & 41.3 & 54.8 & 55.1 & 56.4 & 55.8 \\
+$\Delta$ from $M{=}1$ & --- & +13.5 & +13.8 & +15.1 & +14.5 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \paragraph{Gate type.}
 We compare three gate configurations with $M{=}2$ rounds: no gate ($\mathbf{g} = \mathbf{1}$, pure additive correction), scalar gate (one learned shrinkage value per round, matching the MART $\eta_m$), and per-dimension MLP gate.
-All three produce similar accuracy: MLP gate 55.2\%, scalar gate 55.0\%, and no gate 54.3\%.
-That even the no-gate variant performs comparably confirms that the residual-attention mechanism---not the gating---is the key ingredient.
+Table~\ref{tab:gate} shows that all three produce similar accuracy, with even the no-gate variant improving substantially over the single-round baseline.
+That a single learned scalar performs on par with the per-dimension MLP gate suggests that the separate projections $\mathbf{W}_Q^{(1)}, \mathbf{W}_K^{(1)}, \mathbf{W}_V^{(1)}$ already absorb per-dimension adjustment, leaving the gate to control only the overall correction magnitude.
+More broadly, the narrow spread across gate types confirms that the residual-attention mechanism---not the gating---is the key ingredient.
+
+\begin{table}[t]
+\centering
+\caption{Effect of gate type on pattern retrieval accuracy (\%). All gated variants use $M{=}2$ rounds. Same task as Table~\ref{tab:rounds}.}
+\label{tab:gate}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Gate type} & None & Scalar & MLP & Baseline ($M{=}1$) \\
+\midrule
+Accuracy (\%) & 54.3 & 55.0 & 55.2 & 48.3 \\
+$\Delta$ from baseline & +6.0 & +6.7 & +6.9 & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \paragraph{Scaling with problem difficulty.}
 The benefit of boosting grows with problem difficulty.
-At $d = 64, K = 16, \sigma = 0.3$, the improvement is $+18.7$ percentage points.
-At $d = 128, K = 32, \sigma = 0.3$, it is $+15.7$ points.
-The correction helps most when the initial attention pass makes systematic but correctable errors---precisely the regime where gradient boosting is most effective.
+Across configurations ranging from $(d{=}32, K{=}8)$ to $(d{=}128, K{=}32)$, the improvement over the single-round baseline increases with the number of patterns and with moderate noise levels ($\sigma \leq 0.5$): at $\sigma{=}0.3$ the gain reaches $+18.7$ percentage points for $(d{=}64, K{=}16)$ and $+15.7$ for $(d{=}128, K{=}32)$, compared with $+1.9$ for $(d{=}32, K{=}8)$.
+This is precisely the regime where the initial attention pass makes systematic but correctable errors---where gradient boosting is most effective (full breakdown in Figure~\ref{fig:scaling_ablation}, Appendix~\ref{app:scaling}).
 
 
 \subsection{Analysis}
@@ -548,6 +652,13 @@ PonderNet \citep{banino2021pondernet} learns when to stop iterating.
 All iterate the \emph{same} function on the accumulated state.
 Gradient-boosted attention differs by operating on the \emph{residual} with \emph{different} projections---a distinction that Proposition~\ref{prop:erasure} shows is critical.
 
+\paragraph{Normalization placement and residual structure.}
+\citet{he2016identity} showed that pre-activation placement in ResNets preserves a clean identity shortcut, improving gradient flow and accuracy---the direct precursor of Pre-LN in transformers.
+\citet{xiong2020layer} formally analyzed Pre-LN vs.\ Post-LN, proving that Post-LN produces gradient magnitudes that grow with layer index at initialization, while Pre-LN keeps them bounded.
+\citet{elhage2021mathematical} formalized the transformer residual stream as an additive accumulator: each head and layer writes an independent contribution that is summed into a shared communication channel.
+This additive decomposition---which Pre-LN preserves and Post-LN disrupts---is precisely the structure that gradient boosting requires.
+Our Proposition~\ref{prop:normalization} connects these observations: the identity Jacobian under Pre-LN preserves boosted corrections, while Post-LN's rank-$(d{-}2)$ Jacobian distorts them.
+
 \paragraph{Cross-layer residual methods.}
 Several recent works improve information flow across transformer depth: DeepCrossAttention \citep{heddes2025deepcrossattention} replaces residual connections with depth-wise cross-attention, and Attention Residuals \citep{kimi2026attnres} replaces fixed skip connections with learned softmax attention over all preceding layer outputs, deployed at 48B-parameter scale.
 These methods operate across layers; our approach operates within a single attention computation.
@@ -559,9 +670,10 @@ These methods operate across layers; our approach operates within a single atten
 % ============================================================
 
 \paragraph{Limitations.}
-Our experiments use small models (7--9M parameters) trained on a single benchmark with a limited number of tokens.
-While the param-fair comparison controls for capacity, we have not yet established whether the improvement persists at the 100M--1B scale where most modern attention variants are evaluated \citep{ye2025differential}.
+Our experiments use small models (7--9M parameters) trained on two benchmarks with 10M tokens each.
+While the param-fair comparison controls for capacity and the second benchmark confirms generalization, we have not yet established whether the improvement persists at the 100M--1B scale where most modern attention variants are evaluated \citep{ye2025differential}.
 The additional computational cost of two attention passes per layer may be a concern for latency-sensitive applications, though the key-value computations could be shared to reduce overhead.
+The Post-LN ablation uses a single seed; while the effect is large ($+9.6\%$ degradation), a multi-seed confirmation would strengthen the claim.
 
 \paragraph{What scaling would show.}
 The central question for future work is whether the 1.6\% relative improvement over a parameter-matched baseline holds, grows, or shrinks at larger model and data scales.
@@ -570,6 +682,14 @@ Attention in small models may be in the ``moderately strong'' regime where boost
 
 \paragraph{Future work.}
 Natural extensions include: (i) applying gradient-boosted attention as a drop-in replacement during fine-tuning of pretrained models, which requires no large-scale pretraining; (ii) combining with Differential Transformer for joint noise cancellation and error correction; (iii) learning the number of rounds per head or per layer, analogous to adaptive boosting; (iv) analyzing whether the correction round develops interpretable specialization across heads and layers.
+
+\paragraph{Connection to normalization placement.}
+The finding that gradient-boosted attention requires Pre-LN placement connects our within-layer mechanism to a broader structural principle.
+\citet{cheng2024transformers} proved that Pre-LN transformer layers implement functional gradient descent across depth---mathematically, gradient boosting across layers.
+Our mechanism adds boosting within each layer, at a finer granularity.
+Both levels of boosting require the same structural precondition: an additive residual stream where corrections are preserved without distortion.
+Pre-LN satisfies this at both levels simultaneously; Post-LN disrupts it at both.
+The historical shift from Post-LN \citep{vaswani2017attention} to Pre-LN, typically attributed to training stability \citep{xiong2020layer}, may also be understood as enabling the additive refinement dynamics that gradient boosting formalizes.
 
 \paragraph{Broader motivation.}
 Our architecture was partly motivated by the contrast between single-pass attention (a fast, parallel retrieval) and iterative convergence (a slower, sequential commitment to a single pattern)---a distinction reminiscent of dual-process theories in cognitive science.
@@ -585,7 +705,8 @@ We have introduced gradient-boosted attention, a mechanism that applies gradient
 A second attention pass, with its own learned projections, attends to the prediction error of the first pass and applies a gated correction.
 We showed that the natural alternative---iterating the same attention operation---erases all query information orthogonal to the stored-pattern subspace, and under local contraction can collapse distinct queries in the same region to the same fixed point.
 The formal correspondence to Friedman's MART framework connects a growing body of theoretical work on transformers-as-gradient-descent to the classical boosting literature.
-Experiments on WikiText-103 confirm that gradient-boosted attention outperforms standard attention, Twicing Attention (which reuses the same attention kernel), and a parameter-matched wider baseline, with the improvement attributable to the architectural inductive bias of residual correction with separate projections.
+Experiments on WikiText-103 and OpenWebText confirm that gradient-boosted attention outperforms standard attention, Twicing Attention, and a parameter-matched wider baseline on both benchmarks.
+The normalization ablation reveals a structural requirement: the mechanism depends on Pre-LN's additive residual stream and degrades under Post-LN, consistent with the LayerNorm Jacobian analysis and with the broader principle that gradient boosting requires additive preservation of corrections.
 
 \bibliography{references}
 \bibliographystyle{plainnat}
@@ -596,12 +717,13 @@ Experiments on WikiText-103 confirm that gradient-boosted attention outperforms 
 \section{Hyperparameters and Training Details}
 \label{app:hyperparams}
 
-Table~\ref{tab:hyperparams} lists all hyperparameters for the WikiText-103 language modeling experiments.
-All models share the same training configuration; only the attention mechanism differs.
+Table~\ref{tab:hyperparams} lists all hyperparameters for the language modeling experiments.
+All models share the same training configuration; only the attention mechanism and normalization placement differ.
+OpenWebText experiments use the same hyperparameters with a separately trained BPE tokenizer.
 
 \begin{table}[h]
 \centering
-\caption{Hyperparameters for WikiText-103 experiments.}
+\caption{Hyperparameters for language modeling experiments.}
 \label{tab:hyperparams}
 \begin{tabular}{@{}ll@{}}
 \toprule
@@ -628,8 +750,10 @@ Gradient clipping & 1.0 \\
 Dropout & 0.1 \\
 Weight tying & Yes (embedding = output projection) \\
 \midrule
-Hardware & 1$\times$ NVIDIA RTX 2000 Ada (16GB) \\
-Training time per run & ${\sim}$30 minutes \\
+Hardware & 1$\times$ NVIDIA RTX 2000 Ada (16GB) (WikiText-103) \\
+ & 1$\times$ NVIDIA A100 80GB (OpenWebText, Post-LN) \\
+ & Apple M1 Pro (MPS) (synthetic ablations) \\
+Training time per run & ${\sim}$30 min (RTX 2000), ${\sim}$10 min (A100) \\
 Random seeds & 42, 123 \\
 \bottomrule
 \end{tabular}
@@ -643,6 +767,20 @@ $K$ unit-normalized patterns are sampled uniformly from $\mathbb{R}^d$.
 Queries are generated by selecting a pattern uniformly at random and adding isotropic Gaussian noise with standard deviation $\sigma$.
 Retrieval accuracy is the fraction of queries for which the nearest stored pattern (by Euclidean distance) to the model's output matches the generating pattern.
 All synthetic experiments use cosine similarity plus cross-entropy classification as the training loss, Adam optimizer with learning rate $3 \times 10^{-3}$, batch size 512, and 150 training epochs.
+
+\subsection{Scaling Across Configurations}
+\label{app:scaling}
+
+Figure~\ref{fig:scaling_ablation} shows the full scaling ablation across three dimension/pattern-count settings and multiple noise levels.
+The improvement from boosting is largest at moderate noise ($\sigma \leq 0.5$) and higher dimensionality, where the initial attention pass makes systematic but correctable errors.
+At very high noise ($\sigma \geq 0.8$), even the base learner's errors become difficult to correct, and gains diminish.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\textwidth]{fig_scaling_ablation.pdf}
+\caption{Retrieval accuracy for standard vs.\ gradient-boosted attention ($M{=}2$, MLP gate) across configurations. Numbers above bars indicate the accuracy improvement in percentage points. The benefit of boosting increases with problem dimensionality and is largest at moderate noise levels.}
+\label{fig:scaling_ablation}
+\end{figure}
 
 
 \section{Key/Value Source Ablation}

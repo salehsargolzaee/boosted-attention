@@ -16,14 +16,12 @@ We introduce *gradient-boosted attention*, a mechanism that applies gradient boo
 
 ## Results
 
-On a 10M-token subset of WikiText-103:
-
-| Model | Test PPL | Parameters |
-|-------|----------|------------|
-| Standard (d=256) | 72.2 | 7.4M |
-| Twicing (d=256) | 69.6 | 7.4M |
-| Standard (d=288, param-fair) | 69.0 | 8.8M |
-| **Gradient-boosted (d=256, M=2)** | **67.9** | 8.7M |
+| Model | Params | WikiText-103 | OpenWebText |
+|-------|--------|-------------|-------------|
+| Standard (d=256) | 7.4M | 72.2 | 114.9 |
+| Twicing (d=256) | 7.4M | 69.6 | 110.7 |
+| Standard (d=288, param-fair) | 8.8M | 69.0 | 110.2 |
+| **Gradient-boosted (M=2)** | **8.7M** | **67.9** | **108.5** |
 
 ## Repository Structure
 
@@ -32,18 +30,27 @@ boosted-attention/
 ├── paper/
 │   ├── main.tex              # Paper source (NeurIPS format)
 │   ├── references.bib        # Bibliography
-│   ├── make_figures.py       # Architecture + results figures
+│   ├── make_figures.py       # All paper figures
 │   └── neurips_2026.sty      # Style file
 ├── experiments/
-│   ├── exp_lm_v2.py          # WikiText-103 training (Standard, Boosted, Twicing)
-│   ├── exp_analysis.py       # Post-hoc analysis (gate values, entropy, examples)
-│   ├── exp_ablations.py      # Ablation studies (rounds, gate types)
+│   ├── exp_lm_v2.py          # Language modeling (WikiText-103, OpenWebText)
+│   ├── exp_analysis.py       # Post-hoc analysis (gate values, entropy, convex hull)
+│   ├── exp_ablations.py      # Ablation studies (rounds, gate types, scaling)
+│   ├── analysis_token_freq.py# Token frequency analysis
 │   ├── exp_deq_dual_path.py  # DEQ negative results
 │   └── exp_learned_routing.py# Routing gate negative results
 ├── src/
-│   └── boosted_attention.py  # Core BoostedAttention module
+│   ├── attention.py          # Core attention modules (Standard, Boosted, Twicing)
+│   └── __init__.py
 ├── results/
-│   └── exp_v2_small.json     # Experiment results
+│   ├── exp_v2_small.json               # WikiText-103 results
+│   ├── exp_v2_openwebtext_small.json   # OpenWebText results
+│   ├── exp_v2_wikitext103_small_postln.json # Post-LN ablation results
+│   ├── analysis_gate_values.json       # Gate analysis data
+│   ├── analysis_convex_hull.json       # Convex hull escape data
+│   ├── analysis_token_freq.json        # Token frequency analysis
+│   ├── exp11_summary.json              # DEQ experiment results
+│   └── checkpoints/                    # Trained model weights
 └── requirements.txt
 ```
 
@@ -57,13 +64,23 @@ pip install -r requirements.txt
 
 ### Training
 
-Train all four configurations (Standard, Twicing, param-fair, Boosted) on WikiText-103:
+Train all four configurations on WikiText-103:
 
 ```bash
 python experiments/exp_lm_v2.py --scale small
 ```
 
-Each run takes approximately 30 minutes on a single GPU (tested on NVIDIA RTX 2000 Ada, 16GB).
+Train on OpenWebText:
+
+```bash
+python experiments/exp_lm_v2.py --scale small --dataset openwebtext
+```
+
+Post-LN ablation:
+
+```bash
+python experiments/exp_lm_v2.py --scale small --ln_type post --attn standard boosted
+```
 
 ### Analysis
 

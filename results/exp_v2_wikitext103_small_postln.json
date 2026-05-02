@@ -1,0 +1,23 @@
+{
+  "small/Standard": {
+    "test_mean": 77.19869845632348,
+    "test_std": 0.0,
+    "val_mean": 76.98727654369996,
+    "val_std": 0.0,
+    "n_params": 7419392
+  },
+  "small/Boosted-2": {
+    "test_mean": 84.59621118743675,
+    "test_std": 0.0,
+    "val_mean": 82.51061437014917,
+    "val_std": 0.0,
+    "n_params": 8734208
+  },
+  "small/Std-fair(d=288)": {
+    "test_mean": 71.80616419395194,
+    "test_std": 0.0,
+    "val_mean": 72.19455830320334,
+    "val_std": 0.0,
+    "n_params": 8789184
+  }
+}

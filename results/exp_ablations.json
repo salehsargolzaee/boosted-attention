@@ -1,0 +1,103 @@
+{
+  "ablation_rounds": {
+    "1": {
+      "acc": 41.3,
+      "delta_vs_1": 0.0
+    },
+    "2": {
+      "acc": 54.8,
+      "delta_vs_1": 13.5
+    },
+    "3": {
+      "acc": 55.1,
+      "delta_vs_1": 13.8
+    },
+    "4": {
+      "acc": 56.4,
+      "delta_vs_1": 15.1
+    },
+    "5": {
+      "acc": 55.8,
+      "delta_vs_1": 14.5
+    }
+  },
+  "ablation_gate": {
+    "mlp": {
+      "acc": 55.2
+    },
+    "scalar": {
+      "acc": 55.0
+    },
+    "none": {
+      "acc": 54.3
+    },
+    "baseline": {
+      "acc": 48.3
+    }
+  },
+  "ablation_configs": {
+    "d=32,K=8,s=0.3": {
+      "baseline": 90.5,
+      "boosted": 92.4,
+      "delta": 1.9
+    },
+    "d=32,K=8,s=0.5": {
+      "baseline": 64.9,
+      "boosted": 66.8,
+      "delta": 1.9
+    },
+    "d=32,K=8,s=0.8": {
+      "baseline": 42.1,
+      "boosted": 43.6,
+      "delta": 1.4
+    },
+    "d=32,K=8,s=1.2": {
+      "baseline": 29.4,
+      "boosted": 29.9,
+      "delta": 0.5
+    },
+    "d=64,K=16,s=0.3": {
+      "baseline": 68.7,
+      "boosted": 87.4,
+      "delta": 18.7
+    },
+    "d=64,K=16,s=0.5": {
+      "baseline": 41.3,
+      "boosted": 54.8,
+      "delta": 13.4
+    },
+    "d=64,K=16,s=0.8": {
+      "baseline": 24.7,
+      "boosted": 30.2,
+      "delta": 5.5
+    },
+    "d=64,K=16,s=1.2": {
+      "baseline": 16.0,
+      "boosted": 18.5,
+      "delta": 2.5
+    },
+    "d=128,K=32,s=0.3": {
+      "baseline": 64.6,
+      "boosted": 80.2,
+      "delta": 15.7
+    },
+    "d=128,K=32,s=0.5": {
+      "baseline": 30.5,
+      "boosted": 38.7,
+      "delta": 8.2
+    },
+    "d=128,K=32,s=0.8": {
+      "baseline": 13.6,
+      "boosted": 17.1,
+      "delta": 3.5
+    }
+  },
+  "setup": {
+    "seed": 42,
+    "epochs": 150,
+    "lr": 0.003,
+    "batch_size": 512,
+    "device": "mps",
+    "task": "denoising (cosine + cross-entropy loss)"
+  }
+}
