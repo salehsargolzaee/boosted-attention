@@ -49,8 +49,7 @@ boosted-attention/
 │   ├── analysis_gate_values.json       # Gate analysis data
 │   ├── analysis_convex_hull.json       # Convex hull escape data
 │   ├── analysis_token_freq.json        # Token frequency analysis
-│   ├── exp11_summary.json              # DEQ experiment results
-│   └── checkpoints/                    # Trained model weights
+│   └── exp11_summary.json              # DEQ experiment results
 └── requirements.txt
 ```
 
