@@ -1,8 +1,8 @@
 {
   "ablation_rounds": {
     "bayes_optimal": {
-      "acc": 58.4,
-      "mse": 0.008277
+      "acc": 58.1,
+      "mse": 0.008278
     },
     "1": {
       "acc": 46.0,
@@ -41,61 +41,61 @@
   },
   "ablation_configs": {
     "d=32,K=8,s=0.3": {
-      "bayes_optimal": 93.6,
+      "bayes_optimal": 93.7,
       "baseline": 77.0,
       "boosted": 91.6,
       "delta": 14.6
     },
     "d=32,K=8,s=0.5": {
-      "bayes_optimal": 68.1,
+      "bayes_optimal": 68.8,
       "baseline": 58.0,
       "boosted": 67.6,
       "delta": 9.6
     },
     "d=32,K=8,s=0.8": {
-      "bayes_optimal": 44.8,
+      "bayes_optimal": 45.3,
       "baseline": 39.2,
       "boosted": 44.1,
       "delta": 5.0
     },
     "d=32,K=8,s=1.2": {
-      "bayes_optimal": 30.7,
+      "bayes_optimal": 32.0,
       "baseline": 27.0,
       "boosted": 30.8,
       "delta": 3.8
     },
     "d=64,K=16,s=0.3": {
-      "bayes_optimal": 90.1,
+      "bayes_optimal": 90.7,
       "baseline": 71.0,
       "boosted": 88.8,
       "delta": 17.8
     },
     "d=64,K=16,s=0.5": {
-      "bayes_optimal": 58.4,
+      "bayes_optimal": 58.1,
       "baseline": 46.0,
       "boosted": 55.5,
       "delta": 9.5
     },
     "d=64,K=16,s=0.8": {
-      "bayes_optimal": 33.1,
+      "bayes_optimal": 32.6,
       "baseline": 26.1,
       "boosted": 30.3,
       "delta": 4.2
     },
     "d=64,K=16,s=1.2": {
-      "bayes_optimal": 20.8,
+      "bayes_optimal": 20.4,
       "baseline": 16.4,
       "boosted": 17.8,
       "delta": 1.4
     },
     "d=128,K=32,s=0.3": {
-      "bayes_optimal": 86.9,
+      "bayes_optimal": 86.8,
       "baseline": 68.9,
       "boosted": 82.4,
       "delta": 13.5
     },
     "d=128,K=32,s=0.5": {
-      "bayes_optimal": 48.0,
+      "bayes_optimal": 47.7,
       "baseline": 33.2,
       "boosted": 40.3,
       "delta": 7.2

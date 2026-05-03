@@ -409,14 +409,20 @@ def train_and_evaluate(d, K, noise_std, epochs=150, lr=3e-3, batch_size=512,
 
     # Bayes optimal baseline: softmax attention with β = 1/σ², W = I
     # f_opt(x̃) = Σ_j p_j exp(⟨p_j, x̃⟩/σ²) / Σ_j exp(⟨p_j, x̃⟩/σ²)
+    # Use large n with fixed seed for precise, reproducible estimate
     with torch.no_grad():
+        n_bayes = 200000
+        torch.manual_seed(12345)
+        tidx_b = torch.randint(K, (n_bayes,))
+        tgt_b = patterns[tidx_b]
+        qry_b = tgt_b + noise_std * torch.randn(n_bayes, d, device=device)
         beta_opt = 1.0 / (noise_std ** 2)
-        logits_opt = beta_opt * (qry_v @ patterns.T)  # (n_val, K)
+        logits_opt = beta_opt * (qry_b @ patterns.T)
         weights_opt = F.softmax(logits_opt, dim=-1)
-        out_opt = weights_opt @ patterns  # (n_val, d)
+        out_opt = weights_opt @ patterns
         dists_opt = torch.cdist(out_opt.unsqueeze(0), patterns.unsqueeze(0)).squeeze(0)
-        acc_opt = (dists_opt.argmin(dim=-1) == tidx_v.to(device)).float().mean().item() * 100
-        mse_opt = (out_opt - tgt_v).pow(2).mean().item()
+        acc_opt = (dists_opt.argmin(dim=-1) == tidx_b.to(device)).float().mean().item() * 100
+        mse_opt = (out_opt - tgt_b).pow(2).mean().item()
         eval_results["bayes_optimal"] = {"acc": acc_opt, "mse": mse_opt}
         print(f"  {'bayes_optimal':20s}: acc={acc_opt:.1f}%  mse={mse_opt:.6f}")
 

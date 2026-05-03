@@ -399,7 +399,7 @@ Table~\ref{tab:negative} summarizes results across six configurations.
 & $\sigma{=}0.5$ & $\sigma{=}0.8$ & $\sigma{=}0.5$ & $\sigma{=}0.8$ & $\sigma{=}0.5$ & $\sigma{=}0.8$ \\
 \midrule
 Random chance & 25.0 & 25.0 & 12.5 & 12.5 & 6.3 & 6.3 \\
-Bayes optimal & 80.1 & 61.2 & 69.2 & 44.6 & 58.0 & 32.8 \\
+Bayes optimal & 80.7 & 61.9 & 68.8 & 45.3 & 58.1 & 32.6 \\
 One-step (trained) & 71.1 & 55.0 & 53.1 & 36.4 & 46.5 & 26.1 \\
 Converged (trained, backprop) & 25.2 & 25.2 & 12.1 & 12.1 & 6.7 & 6.7 \\
 Converged (trained, DEQ) & 25.2 & 25.2 & 12.1 & 12.1 & 6.7 & 6.7 \\
@@ -469,7 +469,7 @@ Second, a wider standard model ($d{=}288$, $8.8$M parameters) slightly exceeds t
 \begin{figure}[t]
 \centering
 \includegraphics[width=\textwidth]{fig_results.pdf}
-\caption{\textbf{Left:} WikiText-103 test perplexity (zoomed axis). Gradient-boosted attention outperforms all baselines including Twicing and a parameter-matched wider model. \textbf{Right:} Retrieval accuracy on the synthetic pattern retrieval task as a function of boosting rounds. The dotted line marks the Bayes-optimal ceiling (58.4\%). Four rounds nearly match it (58.1\%); the jump from 1 to 2 rounds captures most of the improvement.}
+\caption{\textbf{Left:} WikiText-103 test perplexity (zoomed axis). Gradient-boosted attention outperforms all baselines including Twicing and a parameter-matched wider model. \textbf{Right:} Retrieval accuracy on the synthetic pattern retrieval task as a function of boosting rounds. The dotted line marks the Bayes-optimal ceiling (58.1\%). Four rounds nearly match it (58.1\%); the jump from 1 to 2 rounds captures most of the improvement.}
 \label{fig:results}
 \end{figure}
 
@@ -512,14 +512,14 @@ We conduct ablations on the synthetic pattern retrieval task ($d = 64$, $K = 16$
 
 \paragraph{Number of boosting rounds.}
 Table~\ref{tab:rounds} shows retrieval accuracy as a function of $M$.
-The Bayes-optimal predictor (58.4\%) provides an analytical ceiling.
+The Bayes-optimal predictor (58.1\%) provides an analytical ceiling.
 The jump from 1 to 2 rounds ($+9.5$ percentage points) accounts for the vast majority of the improvement, bringing accuracy from 46.0\% to 55.5\%---closing most of the gap to Bayes-optimal.
 Additional rounds yield diminishing returns, with 4 rounds (58.1\%) nearly matching the Bayes-optimal ceiling.
 This mirrors the well-known behavior of gradient boosting with strong base learners \citep{friedman2001greedy}, where early rounds capture the dominant signal and later rounds offer marginal gains.
 
 \begin{table}[t]
 \centering
-\caption{Effect of boosting rounds on pattern retrieval accuracy (\%). Synthetic pattern retrieval task, $d=64$, $K=16$, $\sigma=0.5$. Bayes-optimal ceiling: 58.4\%.}
+\caption{Effect of boosting rounds on pattern retrieval accuracy (\%). Synthetic pattern retrieval task, $d=64$, $K=16$, $\sigma=0.5$. Bayes-optimal ceiling: 58.1\%.}
 \label{tab:rounds}
 \begin{tabular}{@{}lccccc@{}}
 \toprule

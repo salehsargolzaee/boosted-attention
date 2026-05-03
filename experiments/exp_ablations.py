@@ -78,10 +78,11 @@ def train_and_eval(model, patterns, d, K, noise_std, epochs=150, lr=3e-3,
 
 
 @torch.no_grad()
-def eval_bayes_optimal(patterns, K, noise_std, n=5000, device=DEVICE):
+def eval_bayes_optimal(patterns, K, noise_std, n=200000, device=DEVICE):
     """Bayes optimal baseline: softmax attention with β=1/σ², W=I.
     From Smart et al. (2025), Proposition 4 (σ₀→0 limit)."""
     patterns = patterns.to(device)
+    torch.manual_seed(12345)
     tidx = torch.randint(K, (n,), device=device)
     targets = patterns[tidx]
     queries = targets + noise_std * torch.randn(n, patterns.shape[1], device=device)
