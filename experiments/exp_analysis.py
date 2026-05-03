@@ -42,9 +42,23 @@ plt.rcParams.update({
 })
 
 
+def find_checkpoint(label, seed=42):
+    """Find checkpoint file, trying new naming format first then old."""
+    candidates = [
+        CKPT_DIR / f'wikitext103_small_{label}_seed{seed}.pt',
+        CKPT_DIR / f'small_{label}_seed{seed}.pt',
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    raise FileNotFoundError(
+        f'No checkpoint found for {label} seed={seed}. Tried: '
+        + ', '.join(p.name for p in candidates))
+
+
 def load_model(label, seed=42):
     """Load a trained model from checkpoint."""
-    ckpt_path = CKPT_DIR / f'small_{label}_seed{seed}.pt'
+    ckpt_path = find_checkpoint(label, seed)
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
 
     if 'Boosted' in label:
@@ -66,14 +80,14 @@ def load_model(label, seed=42):
 def enable_capture(model):
     for layer in model.layers:
         attn = layer['attn']
-        if isinstance(attn, BoostedCausalAttention):
+        if hasattr(attn, 'enable_capture'):
             attn.enable_capture()
 
 
 def disable_capture(model):
     for layer in model.layers:
         attn = layer['attn']
-        if isinstance(attn, BoostedCausalAttention):
+        if hasattr(attn, 'disable_capture'):
             attn.disable_capture()
 
 
@@ -126,20 +140,25 @@ def analysis_gate_values(model, test_data):
 # Analysis 2: Attention entropy — round 0 vs round 1
 # ============================================================
 
-def analysis_attention_entropy(model, test_data):
-    """Compare entropy of attention distributions between round 0 and round 1."""
+def analysis_attention_entropy(model, test_data, model_std=None):
+    """Compare entropy of attention distributions: standard, round 0, round 1."""
     print('\n=== Analysis 2: Attention Entropy ===')
 
     enable_capture(model)
+    if model_std is not None:
+        enable_capture(model_std)
+    entropy_std_all = []
     entropy_r0_all = []
     entropy_r1_all = []
-    layer_entropies = {i: {'r0': [], 'r1': []} for i in range(4)}
+    layer_entropies = {i: {'std': [], 'r0': [], 'r1': []} for i in range(4)}
     n_batches = min(50, len(test_data))
 
     device = next(model.parameters()).device
     with torch.no_grad():
         for b in range(n_batches):
             x = test_data[b:b+1].to(device)
+            if model_std is not None:
+                _ = model_std(x[:, :-1])
             _ = model(x[:, :-1])
             for i in range(4):
                 cached = get_cached(model, i)
@@ -152,15 +171,27 @@ def analysis_attention_entropy(model, test_data):
                     entropy_r1_all.append(e1.reshape(-1).cpu().numpy())
                     layer_entropies[i]['r0'].append(e0.mean().item())
                     layer_entropies[i]['r1'].append(e1.mean().item())
+                if model_std is not None:
+                    cached_s = get_cached(model_std, i)
+                    if cached_s.get('attn'):
+                        a_s = cached_s['attn'][0]
+                        e_s = -(a_s * torch.log(a_s.clamp(min=1e-10))).sum(dim=-1)
+                        entropy_std_all.append(e_s.reshape(-1).cpu().numpy())
+                        layer_entropies[i]['std'].append(e_s.mean().item())
 
     disable_capture(model)
+    if model_std is not None:
+        disable_capture(model_std)
 
     entropy_r0 = np.concatenate(entropy_r0_all)
     entropy_r1 = np.concatenate(entropy_r1_all)
-
+    has_std = len(entropy_std_all) > 0
+    if has_std:
+        entropy_std = np.concatenate(entropy_std_all)
+        print(f'  Standard entropy: mean={entropy_std.mean():.3f}, median={np.median(entropy_std):.3f}')
     print(f'  Round 0 entropy: mean={entropy_r0.mean():.3f}, median={np.median(entropy_r0):.3f}')
     print(f'  Round 1 entropy: mean={entropy_r1.mean():.3f}, median={np.median(entropy_r1):.3f}')
-    print(f'  Entropy reduction: {(entropy_r0.mean() - entropy_r1.mean()) / entropy_r0.mean() * 100:.1f}% relative')
+    print(f'  Entropy reduction (r0→r1): {(entropy_r0.mean() - entropy_r1.mean()) / entropy_r0.mean() * 100:.1f}% relative')
 
     diff = entropy_r0.mean() - entropy_r1.mean()
     if abs(diff) < 0.01 * entropy_r0.mean():
@@ -169,13 +200,18 @@ def analysis_attention_entropy(model, test_data):
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9, 3.5))
 
-    bins = np.linspace(0, max(entropy_r0.max(), entropy_r1.max()), 60)
-    ax1.hist(entropy_r0, bins=bins, alpha=0.6, color='#2980b9', label='Round 0 (initial)', density=True)
-    ax1.hist(entropy_r1, bins=bins, alpha=0.6, color='#e74c3c', label='Round 1 (correction)', density=True)
+    max_ent = max(entropy_r0.max(), entropy_r1.max())
+    if has_std:
+        max_ent = max(max_ent, entropy_std.max())
+    bins = np.linspace(0, max_ent, 60)
+    if has_std:
+        ax1.hist(entropy_std, bins=bins, alpha=0.5, color='#2980b9', label='Standard', density=True)
+    ax1.hist(entropy_r0, bins=bins, alpha=0.5, color='#7f8c8d', label='Boosted (round 0)', density=True)
+    ax1.hist(entropy_r1, bins=bins, alpha=0.5, color='#e74c3c', label='Boosted (round 1)', density=True)
     ax1.set_xlabel('Attention entropy (nats)')
     ax1.set_ylabel('Density')
     ax1.set_title('Attention Entropy Distribution', fontsize=11, fontweight='bold')
-    ax1.legend(fontsize=8)
+    ax1.legend(fontsize=7)
     ax1.grid(True, alpha=0.2, ls='--')
 
     layers = range(4)
@@ -185,17 +221,28 @@ def analysis_attention_entropy(model, test_data):
     r1_stds = [np.std(layer_entropies[i]['r1']) for i in layers]
 
     x_pos = np.arange(4)
-    w = 0.35
-    ax2.bar(x_pos - w/2, r0_means, w, yerr=r0_stds, color='#2980b9', alpha=0.8,
-            label='Round 0', capsize=3)
-    ax2.bar(x_pos + w/2, r1_means, w, yerr=r1_stds, color='#e74c3c', alpha=0.8,
-            label='Round 1', capsize=3)
+    if has_std:
+        std_means = [np.mean(layer_entropies[i]['std']) for i in layers]
+        std_stds = [np.std(layer_entropies[i]['std']) for i in layers]
+        w = 0.25
+        ax2.bar(x_pos - w, std_means, w, yerr=std_stds, color='#2980b9', alpha=0.8,
+                label='Standard', capsize=3)
+        ax2.bar(x_pos, r0_means, w, yerr=r0_stds, color='#7f8c8d', alpha=0.8,
+                label='Round 0', capsize=3)
+        ax2.bar(x_pos + w, r1_means, w, yerr=r1_stds, color='#e74c3c', alpha=0.8,
+                label='Round 1', capsize=3)
+    else:
+        w = 0.35
+        ax2.bar(x_pos - w/2, r0_means, w, yerr=r0_stds, color='#7f8c8d', alpha=0.8,
+                label='Round 0', capsize=3)
+        ax2.bar(x_pos + w/2, r1_means, w, yerr=r1_stds, color='#e74c3c', alpha=0.8,
+                label='Round 1', capsize=3)
     ax2.set_xlabel('Layer')
     ax2.set_ylabel('Mean entropy (nats)')
     ax2.set_xticks(x_pos)
     ax2.set_xticklabels([f'Layer {i}' for i in range(4)], fontsize=9)
     ax2.set_title('Entropy by Layer', fontsize=11, fontweight='bold')
-    ax2.legend(fontsize=8)
+    ax2.legend(fontsize=7)
     ax2.grid(axis='y', alpha=0.2, ls='--')
 
     plt.tight_layout()
@@ -215,6 +262,7 @@ def analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
     print('\n=== Analysis 3: Example Corrections ===')
 
     enable_capture(model_boosted)
+    enable_capture(model_std)
     candidates = []
     n_batches = min(200, len(test_data))
 
@@ -260,12 +308,15 @@ def analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
     selected = []
     used_batches = set()
     for c in candidates:
-        if len(selected) >= 3:
+        if len(selected) >= 2:
             break
         b, pos = c['batch'], c['pos']
         if any(abs(b - ub) < 50 for ub in used_batches):
             continue
         if pos < 10:
+            continue
+        target_tok = tokenizer.decode([c['target']]).strip()
+        if len(target_tok) < 2:
             continue
         x = test_data[b]
         context_ids = x[max(0, pos-11):pos+2].tolist()
@@ -280,6 +331,7 @@ def analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
     if len(selected) < 2:
         print('  Not enough good examples found.')
         disable_capture(model_boosted)
+        disable_capture(model_std)
         return
 
     fig, axes = plt.subplots(len(selected), 1, figsize=(7, 2.5 * len(selected)))
@@ -291,16 +343,20 @@ def analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
         x = test_data[b:b+1].to(device)
 
         with torch.no_grad():
+            _ = model_std(x[:, :-1])
             _ = model_boosted(x[:, :-1])
 
-        cached = get_cached(model_boosted, 1)  # layer 1
-        attn_r0 = cached['attn'][0][0].mean(dim=0).cpu().numpy()
-        attn_r1 = cached['attn'][1][0].mean(dim=0).cpu().numpy()
+        cached_std = get_cached(model_std, 1)  # layer 1
+        cached_boost = get_cached(model_boosted, 1)  # layer 1
+        attn_std = cached_std['attn'][0][0].mean(dim=0).cpu().numpy()
+        attn_r0 = cached_boost['attn'][0][0].mean(dim=0).cpu().numpy()
+        attn_r1 = cached_boost['attn'][1][0].mean(dim=0).cpu().numpy()
 
         ctx_start = c['context_start']
         ctx_end = pos + 1
         n_ctx = ctx_end - ctx_start
 
+        attn_std_row = attn_std[pos, ctx_start:ctx_end]
         attn_r0_row = attn_r0[pos, ctx_start:ctx_end]
         attn_r1_row = attn_r1[pos, ctx_start:ctx_end]
 
@@ -317,15 +373,16 @@ def analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
 
         ax = axes[row]
         x_pos = np.arange(n_ctx)
-        w = 0.35
-        ax.bar(x_pos - w/2, attn_r0_row, w, color='#2980b9', alpha=0.8, label='Round 0')
-        ax.bar(x_pos + w/2, attn_r1_row, w, color='#e74c3c', alpha=0.8, label='Round 1')
+        w = 0.25
+        ax.bar(x_pos - w, attn_std_row, w, color='#2980b9', alpha=0.8, label='Standard')
+        ax.bar(x_pos, attn_r0_row, w, color='#7f8c8d', alpha=0.8, label='Boosted (round 0)')
+        ax.bar(x_pos + w, attn_r1_row, w, color='#e74c3c', alpha=0.8, label='Boosted (round 1)')
         ax.set_xticks(x_pos)
         ax.set_xticklabels(raw_labels, rotation=40, ha='right', fontsize=7)
         ax.set_ylabel('Attn weight', fontsize=8)
         ax.grid(axis='y', alpha=0.15, ls='--')
         if row == 0:
-            ax.legend(fontsize=7, loc='upper left', ncol=2)
+            ax.legend(fontsize=7, loc='upper left', ncol=3)
 
         marker = '✓' if c['boost_correct'] else ''
         ax.set_title(
@@ -334,7 +391,7 @@ def analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
             f'Boosted: "{pred_boost_tok}" {marker} (loss {c["loss_boost"]:.1f})',
             fontsize=8, fontfamily='monospace', pad=8)
 
-    plt.suptitle('Example Corrections: Attention Redistribution in Layer 1 (head-averaged)',
+    plt.suptitle('Attention Comparison in Layer 1 (head-averaged)',
                  fontsize=10, fontweight='bold')
     plt.tight_layout()
     for ext in ['pdf', 'png']:
@@ -354,6 +411,7 @@ def analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
               f'improvement={c["improvement"]:.2f} nats')
 
     disable_capture(model_boosted)
+    disable_capture(model_std)
 
 
 # ============================================================
@@ -471,7 +529,7 @@ if __name__ == '__main__':
     _, _, test_data, tokenizer, actual_vocab = get_wikitext_data(
         seq_len=256, vocab_size=16384, max_train_tokens=100_000)
 
-    needs_std = 3 in analyses
+    needs_std = bool(analyses & {2, 3})
     needs_boosted = bool(analyses & {1, 2, 3, 4})
 
     if needs_std:
@@ -484,7 +542,7 @@ if __name__ == '__main__':
     if 1 in analyses:
         analysis_gate_values(model_boosted, test_data)
     if 2 in analyses:
-        analysis_attention_entropy(model_boosted, test_data)
+        analysis_attention_entropy(model_boosted, test_data, model_std=model_std)
     if 3 in analyses:
         analysis_example_corrections(model_std, model_boosted, test_data, tokenizer)
     if 4 in analyses:

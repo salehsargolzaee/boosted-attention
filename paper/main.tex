@@ -56,7 +56,7 @@ We further show, both theoretically and empirically, that the mechanism requires
 
 The attention mechanism \citep{vaswani2017attention} computes a softmax-weighted combination of value vectors, conditioned on query-key similarities.
 This is a single-pass operation: the query is compared against all keys once, a probability distribution is formed, and values are averaged accordingly.
-If the resulting estimate is poor---because the query is ambiguous, the relevant keys are diluted among many distractors, or the softmax assigns weight to incompatible values---there is no within-layer mechanism to detect or correct the error.
+When this estimate is poor, whether because the query is ambiguous, the relevant keys are diluted among distractors, or the softmax assigns weight to incompatible values, there is no within-layer mechanism to detect or correct the error.
 
 A parallel limitation has long been understood in classical machine learning.
 A single regression tree or a single kernel smoother produces a biased estimate; the bias can be reduced by fitting a second model to the \emph{residual} of the first.
@@ -76,7 +76,7 @@ This corresponds to running the modern Hopfield network \citep{ramsauer2021hopfi
 We show (Section~\ref{sec:theory}, Proposition~\ref{prop:erasure}) that this approach systematically destroys query information.
 Under the local contraction conditions established by \citet{ramsauer2021hopfield}, queries in the same contraction region converge to the same fixed point, which is determined by the stored patterns and temperature alone.
 This makes iteration appropriate for content-addressable memory (where the goal is to retrieve a stored pattern) but harmful for the transformer's actual task (where the query carries information that must be preserved in the output).
-Our negative results---including training with Deep Equilibrium Models \citep{bai2019deep}---confirm that the iterative approach failed under all training procedures we tested (Section~\ref{sec:negative}).
+Our negative results---including training with Deep Equilibrium Models (DEQ) \citep{bai2019deep}---confirm that the iterative approach failed under all training procedures we tested (Section~\ref{sec:negative}).
 Gradient-boosted attention avoids this failure mode by feeding a \emph{different} signal (the residual) through \emph{different} projections, rather than re-processing the same state through the same function.
 
 \paragraph{Relation to prior work.}
@@ -89,9 +89,9 @@ We discuss these and other related works in detail in Section~\ref{sec:related}.
 
 \paragraph{Contributions.}
 \begin{enumerate}
-    \item We introduce gradient-boosted attention, a multi-round attention mechanism in which each round corrects the prediction error of previous rounds using separate learned projections and a per-dimension gate. The architecture maps directly onto Friedman's MART framework.
+    \item We introduce gradient-boosted attention, a multi-round attention mechanism in which each round corrects the prediction error of previous rounds using separate learned projections and a per-dimension gate. The architecture maps directly onto Friedman's Multiple Additive Regression Trees (MART) framework.
 
-    \item We show that a single attention step discards all query information orthogonal to the stored patterns (Proposition~\ref{prop:erasure}), establish a formal correspondence to Friedman's gradient boosting under a reconstruction objective (Proposition~\ref{prop:mart}), and show that separate projections applied to the residual can both attend to different tokens and produce values in a different subspace than the first round, escaping the convex hull of the original value vectors (Proposition~\ref{prop:separate}).
+    \item We identify a fundamental limitation of iterative retrieval: query information orthogonal to the stored patterns is erased after one step, and further iteration collapses distinct queries to the same fixed point (Proposition~\ref{prop:erasure}). We establish a formal correspondence to Friedman's gradient boosting under a reconstruction objective (Proposition~\ref{prop:mart}), and show that shared-projection corrections like Twicing are confined to the row span of the original value matrix and are not fitted to the residual; gradient-boosted attention's separate projections escape both constraints (Proposition~\ref{prop:separate}).
 
     \item We show that Post-LN placement disrupts the additive structure required by gradient boosting: the well-known rank-$(d{-}2)$ LayerNorm Jacobian \citep{xiong2020layer} couples dimensions and rescales corrections by a data-dependent factor, breaking the element-wise gate control (Proposition~\ref{prop:normalization}). Empirically, gradient-boosted attention improves perplexity by $6.0\%$ under Pre-LN but degrades it by $9.6\%$ under Post-LN, while a parameter-matched wider baseline improves under both placements.
 
@@ -179,7 +179,7 @@ Algorithm~\ref{alg:boosted} summarizes the forward pass.
 In Friedman's framework, the shrinkage parameter $\eta_m$ is a scalar that regularizes each boosting step.
 Our gate $\mathbf{g}_m = \sigma(\mathbf{W}_g^{(m)}[F \| \mathbf{c}_m]) \in [0,1]^d$ generalizes this in two ways: it is (i) per-dimension, allowing selective correction along different feature directions, and (ii) input-dependent, allowing the model to vary the correction magnitude based on the current prediction and the proposed correction.
 When collapsed to a scalar, the gate reduces exactly to the shrinkage parameter.
-We verify in our ablations (Section~\ref{sec:ablations}) that all gate variants (scalar, per-dimension, MLP) improve over the no-gate baseline, suggesting that the residual-attention mechanism is the primary ingredient.
+We verify in our ablations (Section~\ref{sec:ablations}) that all gate variants (no gate, scalar, per-dimension MLP) improve over the single-round baseline, suggesting that the residual-attention mechanism is the primary ingredient.
 
 \paragraph{Computational cost.}
 With $M$ rounds, the attention computation is approximately $M$ times the cost of standard attention, plus a small gating network.
@@ -192,7 +192,7 @@ We show in Section~\ref{sec:experiments} that the improvement cannot be replicat
 \subsection{Connection to MART}
 \label{sec:mart_connection}
 
-Table~\ref{tab:mart} makes the correspondence between Friedman's Multiple Additive Regression Trees (MART) and gradient-boosted attention explicit.
+Table~\ref{tab:mart} makes the correspondence between MART and gradient-boosted attention explicit.
 Under the squared reconstruction objective $L = \frac{1}{2}\|\mathbf{x} - F\|^2$, the forward pass of Algorithm~\ref{alg:boosted} instantiates gradient boosting exactly: the residual is the negative gradient, each attention round is a base learner, and the gate is the shrinkage parameter.
 Note that this is an internal objective governing the within-layer residual computation; the model is trained end-to-end with the task loss (e.g., cross-entropy for language modeling).
 
@@ -219,12 +219,14 @@ Update & $F_m = F_{m-1} + \eta_m f_m$ & $F_m = F_{m-1} + \mathbf{g}_m \odot \mat
 \label{sec:theory}
 % ============================================================
 
-We present three results that collectively motivate and justify the gradient-boosted attention design.
+We present four results that collectively motivate and justify the gradient-boosted attention design.
 
-\subsection{Iterating Attention Erases Query Information}
+\subsection{Iterating Retrieval Erases Query Information}
 
 The most natural way to ``boost'' attention would be to iterate the same operation: compute $T(\boldsymbol{\xi})$, then $T(T(\boldsymbol{\xi}))$, and so on, converging to the Hopfield fixed point.
-We show this approach is fundamentally flawed.
+We state the result in the Hopfield setting (Eq.~\ref{eq:hopfield}), where the analysis is cleanest.
+Part~(a) generalizes directly to standard attention with separate projections: the softmax always produces convex weights, so the output lies in $\mathrm{conv}(\mathbf{V})$ regardless of how $\mathbf{Q}$, $\mathbf{K}$, $\mathbf{V}$ are computed.
+Our negative experiments (Section~\ref{sec:negative}) confirm that iteration fails in practice even with learned $\mathbf{W}_Q, \mathbf{W}_K, \mathbf{W}_V$.
 
 \begin{proposition}[One-step projection and information loss]
 \label{prop:erasure}
@@ -280,7 +282,7 @@ The only difference is that $\eta_m$ in MART is a scalar optimized via line sear
 \end{proof}
 
 \begin{remark}
-\citet{cheng2024transformers} proved that the $L$-layer transformer implements $L$ steps of functional gradient descent in a reproducing kernel Hilbert space, but did not connect this to the classical boosting literature or to Friedman's MART.
+\citet{cheng2024transformers} proved that the $L$-layer transformer implements $L$ steps of functional gradient descent in a reproducing kernel Hilbert space (RKHS), but did not connect this to the classical boosting literature or to Friedman's MART.
 Our construction makes this connection explicit and operates at a finer granularity: boosting within a single layer rather than across layers.
 \end{remark}
 
@@ -288,34 +290,38 @@ Our construction makes this connection explicit and operates at a finer granular
 \subsection{Why Separate Projections Are Necessary}
 
 \citet{abdullaev2025twicing} proposed Twicing Attention, which smooths the residual $\mathbf{V} - \mathbf{A}\mathbf{V}$ using the \emph{same} attention matrix $\mathbf{A}$, yielding the output $(2\mathbf{A} - \mathbf{A}^2)\mathbf{V}$.
-We show that reusing $\mathbf{A}$ imposes a key limitation.
+We identify two structural limitations of this shared-projection approach that gradient-boosted attention overcomes.
 
-\begin{proposition}[Limitation of shared attention in Twicing]
+\begin{proposition}[Limitations of shared-projection correction]
 \label{prop:separate}
-Let $\mathbf{A} = \mathrm{softmax}(\mathbf{Q}\mathbf{K}^\top / \sqrt{d_h})$ and consider the Twicing output
-\begin{equation}
-    (2\mathbf{A} - \mathbf{A}^2)\mathbf{V} = \mathbf{A}\mathbf{V} + \mathbf{A}(\mathbf{V} - \mathbf{A}\mathbf{V}).
-\end{equation}
-Both the base term and the correction term depend on the same attention weights $A_{ij}$ and the same value matrix $\mathbf{V}$.
-In particular, if a token $j$ receives negligible attention weight ($A_{ij} \approx 0$ for all queries $i$), then its contribution to both $\mathbf{A}\mathbf{V}$ and $\mathbf{A}(\mathbf{V} - \mathbf{A}\mathbf{V})$ is negligible, regardless of the magnitude of its residual $\mathbf{V}_j - [\mathbf{A}\mathbf{V}]_j$.
-Moreover, the correction output $(2\mathbf{A} - \mathbf{A}^2)\mathbf{V}$ remains in $\mathrm{conv}(\mathbf{V})$, the same convex hull as the base output $\mathbf{A}\mathbf{V}$.
+Let $\mathbf{A} = \mathrm{softmax}(\mathbf{Q}\mathbf{K}^\top / \sqrt{d_h}) \in \mathbb{R}^{N \times N}$ and $\mathbf{V} = \mathbf{W}_V^{(0)}\mathbf{x} \in \mathbb{R}^{N \times d}$.
+\begin{enumerate}
+    \item[(a)] \emph{Row-span confinement.}
+    For any polynomial $p$, each row of $p(\mathbf{A})\mathbf{V}$ is a linear combination of the rows of $\mathbf{V}$.
+    In particular, the Twicing output $(2\mathbf{A} - \mathbf{A}^2)\mathbf{V}$---and any higher-degree polynomial extension---is confined to $\mathrm{rowspan}(\mathbf{V})$, the subspace spanned by the original value vectors.
 
-In contrast, gradient-boosted attention computes the correction via $\mathrm{Attn}_1(\mathbf{r})$, where the residual $\mathbf{r} = \mathbf{x} - F_0$ is projected through separate $\mathbf{W}_Q^{(1)}, \mathbf{W}_K^{(1)}, \mathbf{W}_V^{(1)}$.
-This differs from Twicing in two ways: (i) the attention matrix $\mathbf{A}' = \mathrm{softmax}(\mathbf{Q}'\mathbf{K}'^\top/\sqrt{d_h})$ is unconstrained by $\mathbf{A}$, so tokens that received negligible weight under $\mathbf{A}$ may receive significant weight under $\mathbf{A}'$; and (ii) the value vectors $\mathbf{V}' = \mathbf{W}_V^{(1)}\mathbf{r}$ span a different subspace than $\mathbf{V} = \mathbf{W}_V^{(0)}\mathbf{x}$, so the gated correction $F_0 + \mathbf{g} \odot \mathbf{A}'\mathbf{V}'$ can escape $\mathrm{conv}(\mathbf{V})$.
+    \item[(b)] \emph{Fixed correction.}
+    Twicing's correction $\mathbf{A}(\mathbf{I} - \mathbf{A})\mathbf{V}$ is uniquely determined by $\mathbf{A}$ and $\mathbf{V}$ with no free parameters: in the MART framework of Proposition~\ref{prop:mart}, the weak learner is not fitted to the residual.
+
+    \item[(c)] \emph{Gradient-boosted attention escapes both constraints.}
+    The correction $\mathbf{g} \odot \mathbf{A}'\mathbf{V}'$, where $\mathbf{A}' = \mathrm{softmax}(\mathbf{Q}'\mathbf{K}'{}^\top / \sqrt{d_h})$ with $\mathbf{Q}' = \mathbf{W}_Q^{(1)}\mathbf{r}$, $\mathbf{K}' = \mathbf{W}_K^{(1)}\mathbf{r}$, $\mathbf{V}' = \mathbf{W}_V^{(1)}\mathbf{r}$, produces value vectors generically outside $\mathrm{rowspan}(\mathbf{V})$, and the projections are fitted to the residual by backpropagation.
+\end{enumerate}
 \end{proposition}
 
 \begin{proof}
-For Twicing, the correction term at position $i$ is
-$[\mathbf{A}(\mathbf{V} - \mathbf{A}\mathbf{V})]_i = \sum_j A_{ij}(\mathbf{V}_j - [\mathbf{A}\mathbf{V}]_j)$.
-The contribution of token $j$ is scaled by $A_{ij}$.
-If $A_{ij} \approx 0$ for all $i$, then token $j$ contributes negligibly to both $\mathbf{A}\mathbf{V}$ and $\mathbf{A}(\mathbf{V}-\mathbf{A}\mathbf{V})$, regardless of the magnitude of its residual.
-Furthermore, $(2\mathbf{A} - \mathbf{A}^2)\mathbf{V}$ where $2\mathbf{A} - \mathbf{A}^2$ is doubly stochastic (rows sum to one, entries are nonneg), so the output remains a convex combination of the rows of $\mathbf{V}$.
+(a) $p(\mathbf{A})\mathbf{V} = \sum_k c_k \mathbf{A}^k\mathbf{V}$.
+Each row of $\mathbf{A}\mathbf{V}$ is $\sum_j A_{ij}\mathbf{v}_j$, a linear combination of value vectors; by induction the same holds for $\mathbf{A}^k\mathbf{V}$, hence for any $p(\mathbf{A})\mathbf{V}$.
 
-In gradient-boosted attention, the correction uses $\mathbf{A}'$ and $\mathbf{V}'$, both derived from $\mathbf{r}$ through separate projections.
-Since $\mathbf{A}'$ is unconstrained by $\mathbf{A}$, it may attend to different tokens.
-Since $\mathbf{V}' = \mathbf{W}_V^{(1)} \mathbf{r}$ and $\mathbf{V} = \mathbf{W}_V^{(0)} \mathbf{x}$ are produced by different projections of different inputs, $\mathrm{col}(\mathbf{V}')$ and $\mathrm{col}(\mathbf{V})$ are generically distinct, and $F_0 + \mathbf{g} \odot \mathbf{A}'\mathbf{V}'$ can lie outside $\mathrm{conv}(\mathbf{V})$. \qed
+(b) The output $(2\mathbf{A} - \mathbf{A}^2)\mathbf{V}$ is a deterministic function of $\mathbf{A}$ and $\mathbf{V}$; the correction introduces no learnable parameters.
+
+(c) Since $\mathbf{V}' = \mathbf{W}_V^{(1)}\mathbf{r}$ and $\mathbf{V} = \mathbf{W}_V^{(0)}\mathbf{x}$ use different projections of different inputs ($\mathbf{r} = \mathbf{x} - F_0 \neq \mathbf{x}$ in general), $\mathrm{rowspan}(\mathbf{V}')$ and $\mathrm{rowspan}(\mathbf{V})$ are generically distinct.
+The projections $\mathbf{W}_Q^{(1)}, \mathbf{W}_K^{(1)}, \mathbf{W}_V^{(1)}$ are trained jointly, fitting the weak learner to the residual signal. \qed
 \end{proof}
 
+\begin{remark}
+\citet{abdullaev2025twicing} exploit the spectral structure of part~(a) positively: they show the polynomial $\tilde{p}(\lambda) = 2\lambda - \lambda^2$ slows eigencapacity decay from $O(n^{-1})$ to $O(n^{-1/2})$ across layers, mitigating representation collapse without additional parameters.
+Gradient-boosted attention addresses a complementary problem: rather than optimizing the spectral filter within $\mathrm{rowspan}(\mathbf{V})$, it introduces independent projections that fit the correction to the prediction residual, producing value vectors that can represent directions the original $\mathbf{V}$ cannot express.
+\end{remark}
 
 \subsection{Normalization Placement and the Additive Structure}
 \label{sec:normalization}
@@ -350,7 +356,7 @@ Consider a transformer layer with sublayer output $\mathbf{f} \in \mathbb{R}^d$ 
 \begin{proof}
 (a) Since $\mathbf{h}_{l+1} = \mathbf{h}_l + \mathbf{f}$ and $\mathbf{h}_l$ does not depend on $\mathbf{f}$, the Jacobian is immediate.
 
-(b) The $i$-th component of $\mathrm{LN}(\mathbf{u})$ is $\gamma_i(u_i - \mu)/\sigma + \beta_i$.
+(b) The $i$-th component of $\mathrm{LN}(\mathbf{u})$ is $\gamma_i(u_i - \mu)/\sigma + b_i$, where $b_i$ is the learned bias.
 Using $\partial \mu / \partial u_j = 1/d$ and $\partial \sigma / \partial u_j = (u_j - \mu)/(d\sigma)$:
 \[
 \frac{\partial [\mathrm{LN}(\mathbf{u})]_i}{\partial u_j} = \frac{\gamma_i}{\sigma}\left(\delta_{ij} - \frac{1}{d} - \frac{\hat{u}_i \hat{u}_j}{d}\right).
@@ -379,12 +385,12 @@ This connection is consistent with the identity-mapping principle of \citet{he20
 Before presenting our main experiments, we summarize the empirical evidence that motivated the gradient-boosted attention design.
 These negative results complement Proposition~\ref{prop:erasure} by showing that the failure of iterative attention persists across the training methods and architectural modifications we tested.
 
-We trained attention models on a pattern denoising task following the setup of \citet{smart2025incontext}: $K$ normalized patterns in $\mathbb{R}^d$, queries corrupted by additive Gaussian noise with standard deviation $\sigma$, evaluated by nearest-pattern retrieval accuracy.
+We trained attention models on a synthetic pattern retrieval task: $K$ unit-normalized patterns in $\mathbb{R}^d$, queries corrupted by additive Gaussian noise with standard deviation $\sigma$, evaluated by nearest-pattern retrieval accuracy (see Appendix~\ref{app:denoising} for details).
 Table~\ref{tab:negative} summarizes results across six configurations.
 
 \begin{table}[t]
 \centering
-\caption{Retrieval accuracy (\%) for one-step attention vs.\ DEQ-trained converged attention. Random chance is $100/K$. Across all configurations, convergence degrades accuracy to near chance. Learned routing gates (5 feature sets) never exceed one-step accuracy.}
+\caption{Retrieval accuracy (\%) on the synthetic pattern retrieval task. The Bayes-optimal predictor (softmax attention with $\beta = 1/\sigma^2$, identity projections) provides an analytical ceiling. Both converged variants---whether trained by backpropagation through 20 iterations or by DEQ implicit differentiation---collapse to near chance, while one-step attention approaches the Bayes-optimal ceiling.}
 \label{tab:negative}
 \begin{tabular}{@{}lcccccc@{}}
 \toprule
@@ -393,20 +399,22 @@ Table~\ref{tab:negative} summarizes results across six configurations.
 & $\sigma{=}0.5$ & $\sigma{=}0.8$ & $\sigma{=}0.5$ & $\sigma{=}0.8$ & $\sigma{=}0.5$ & $\sigma{=}0.8$ \\
 \midrule
 Random chance & 25.0 & 25.0 & 12.5 & 12.5 & 6.3 & 6.3 \\
-One-step (trained) & 78.9 & 59.7 & 59.8 & 39.5 & 39.2 & 22.9 \\
-DEQ converged (trained) & 25.6 & 25.6 & 11.9 & 11.9 & 5.6 & 5.6 \\
+Bayes optimal & 80.1 & 61.2 & 69.2 & 44.6 & 58.0 & 32.8 \\
+One-step (trained) & 71.1 & 55.0 & 53.1 & 36.4 & 46.5 & 26.1 \\
+Converged (trained, backprop) & 25.2 & 25.2 & 12.1 & 12.1 & 6.7 & 6.7 \\
+Converged (trained, DEQ) & 25.2 & 25.2 & 12.1 & 12.1 & 6.7 & 6.7 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \paragraph{Iterating attention destroys accuracy.}
-Across all six configurations in Table~\ref{tab:negative}, the DEQ-trained converged path achieves accuracy indistinguishable from random chance (e.g., 5.6\% vs.\ 6.3\% chance for $K{=}16$), while one-step attention achieves 22--79\% depending on the difficulty.
+Across all six configurations in Table~\ref{tab:negative}, both converged variants---trained with backpropagation through 20 unrolled iterations and with implicit differentiation via Deep Equilibrium Models \citep{bai2019deep}---achieve accuracy indistinguishable from random chance (e.g., 6.7\% vs.\ 6.3\% chance for $K{=}16$), while one-step attention reaches 26--71\% depending on difficulty, approaching the analytical Bayes-optimal ceiling.
 This is consistent with Proposition~\ref{prop:erasure} and the local-contraction analysis of \citet{ramsauer2021hopfield}: queries in the same contraction region converge to the same fixed point regardless of their initial position.
 
-\paragraph{Implicit differentiation does not help.}
-One might suspect the failure is due to vanishing gradients through many iteration steps.
-We used Deep Equilibrium Models \citep{bai2019deep} to provide exact gradients at the fixed point via the implicit function theorem, bypassing the iterative computation graph entirely.
-The converged path still achieved random-chance accuracy (Table~\ref{tab:negative}), confirming that the information loss is structural---a consequence of the contraction dynamics---not a training artifact.
+\paragraph{The failure is structural, not a training artifact.}
+One might suspect vanishing gradients through many iteration steps cause the converged path to fail.
+We rule this out with two controls: (i)~backpropagation through the unrolled iteration graph, which provides gradients but may suffer from vanishing signal over 20 steps, and (ii)~Deep Equilibrium Models, which compute exact gradients at the fixed point via the implicit function theorem, bypassing the iteration graph entirely.
+Both achieve identical random-chance accuracy (Table~\ref{tab:negative}), confirming that the information loss is a consequence of the contraction dynamics themselves, not of how gradients are computed.
 
 \paragraph{Learned routing gates learn trivial strategies.}
 We trained routing gates with five different feature sets (both outputs, their difference, scalar divergence, attention entropy) to decide when to trust the converged path.
@@ -423,7 +431,7 @@ The converged path contains no useful complementary signal.
 
 \paragraph{Setup.}
 We train small transformer language models from scratch and compare four attention configurations: (1)~\textbf{Standard} causal multi-head attention with $d = 256$, 4 layers, and 4 heads (7.4M parameters); (2)~\textbf{Twicing} Attention \citep{abdullaev2025twicing} with the same architecture, applying the correction $(2\mathbf{A} - \mathbf{A}^2)\mathbf{V}$ at no additional parameter cost (7.4M parameters); (3)~a \textbf{parameter-fair} standard model with $d = 288$, matching the parameter count of the boosted model (8.8M parameters); and (4)~\textbf{gradient-boosted attention} ($M = 2$) with separate QKV projections per round and a per-dimension sigmoid gate (8.7M parameters).
-All models use Pre-LN placement \citep{xiong2020layer}, BPE tokenization (16K vocabulary), sequence length 256, AdamW optimizer with learning rate $3 \times 10^{-4}$, cosine schedule with 1500 warmup steps, weight tying, and gradient clipping at 1.0.
+All models use Pre-LN placement \citep{xiong2020layer}, byte-pair encoding (BPE) tokenization (16K vocabulary), sequence length 256, AdamW optimizer with learning rate $3 \times 10^{-4}$, cosine schedule with 1500 warmup steps, weight tying, and gradient clipping at 1.0.
 We evaluate on two benchmarks: (i) a \textbf{10M-token subset} of WikiText-103 \citep{merity2016pointer} (the full corpus contains ${\sim}103$M tokens), and (ii) a \textbf{10M-token subset} of OpenWebText \citep{gokaslan2019openwebtext}, an open reproduction of WebText containing Reddit-upvoted web content.
 Each benchmark uses a separately trained BPE tokenizer; perplexity values are comparable only within the same dataset.
 We train for 15 epochs and report test perplexity averaged over 2 random seeds.
@@ -435,33 +443,33 @@ Full hyperparameters are listed in Appendix~\ref{app:hyperparams}.
 \centering
 \caption{Test perplexity (lower is better) on two benchmarks. All models use Pre-LN. Perplexity values are not comparable across datasets (different tokenizers). Gradient-boosted attention outperforms all baselines on both benchmarks, including a wider model with matched parameter count.}
 \label{tab:main_results}
-\begin{tabular}{@{}lcccc@{}}
+\begin{tabular}{@{}lccc@{}}
 \toprule
-& & \multicolumn{2}{c}{\textbf{Test Perplexity}} & \\
+& & \multicolumn{2}{c}{\textbf{Test Perplexity}} \\
 \cmidrule(lr){3-4}
-\textbf{Model} & \textbf{Params} & \textbf{WikiText-103} & \textbf{OpenWebText} & \textbf{Rel.\ $\Delta$ (WT)} \\
+\textbf{Model} & \textbf{Params} & \textbf{WikiText-103} & \textbf{OpenWebText} \\
 \midrule
-Standard ($d{=}256$)              & 7.4M & $72.2 \pm 0.3$ & $114.9 \pm 0.5$ & --- \\
-Twicing ($d{=}256$)               & 7.4M & $69.6 \pm 0.1$ & $110.7 \pm 0.3$ & $-3.6\%$ \\
-Standard ($d{=}288$, param-fair)  & 8.8M & $69.0 \pm 0.1$ & $110.2 \pm 0.5$ & $-4.4\%$ \\
-Gradient-boosted ($M{=}2$) & 8.7M & $\mathbf{67.9 \pm 0.1}$ & $\mathbf{108.5 \pm 0.9}$ & $\mathbf{-6.0\%}$ \\
+Standard ($d{=}256$)              & 7.4M & $72.2 \pm 0.3$ & $114.9 \pm 0.5$ \\
+Twicing ($d{=}256$)               & 7.4M & $69.6 \pm 0.1$ & $110.7 \pm 0.3$ \\
+Standard ($d{=}288$, param-fair)  & 8.8M & $69.0 \pm 0.1$ & $110.2 \pm 0.5$ \\
+Gradient-boosted ($M{=}2$) & 8.7M & $\mathbf{67.9 \pm 0.1}$ & $\mathbf{108.5 \pm 0.9}$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 Table~\ref{tab:main_results} shows the results.
-On WikiText-103, gradient-boosted attention achieves a test perplexity of $67.9$, improving over standard attention by $4.3$ points ($6.0\%$ relative).
-Three comparisons isolate different contributions.
-Compared with Twicing ($69.6 \to 67.9$, $-1.7$ points), both methods correct the initial attention estimate, but separate projections with a learned gate outperform the fixed shared-kernel correction $(2\mathbf{A} - \mathbf{A}^2)\mathbf{V}$, validating Proposition~\ref{prop:separate}.
-Compared with the parameter-matched wider baseline ($69.0 \to 67.9$, $-1.1$ points), the wider standard model has slightly more parameters ($8.8$M vs $8.7$M) yet lacks the error-correction mechanism; this gap isolates the architectural contribution of residual fitting.
+Gradient-boosted attention achieves $67.9$ perplexity on WikiText-103 and $108.5$ on OpenWebText, the best on both benchmarks.
+Relative to standard attention, this is a $6.0\%$ reduction on WikiText-103 and $5.6\%$ on OpenWebText.
 
-On OpenWebText, the same pattern holds: gradient-boosted attention achieves $108.5$ vs.\ $114.9$ for standard ($5.6\%$ relative improvement) and $110.2$ for the parameter-fair baseline ($1.5\%$ improvement).
-Standard deviations are tight on both benchmarks, confirming stability across random seeds.
+Three comparisons isolate the source of improvement.
+First, Twicing and our method both correct the initial attention estimate, but Twicing uses a fixed shared-kernel correction $(2\mathbf{A} - \mathbf{A}^2)\mathbf{V}$ while gradient-boosted attention uses separate projections per round with a learned gate.
+The consistent gap across both datasets ($-1.7$ and $-2.2$ points, respectively) validates Proposition~\ref{prop:separate}: independent projections can fit residual structure that a shared kernel cannot.
+Second, a wider standard model ($d{=}288$, $8.8$M parameters) slightly exceeds the boosted model in parameter count yet falls short on both benchmarks, isolating the contribution of the residual-fitting architecture from additional capacity alone.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\textwidth]{fig_results.pdf}
-\caption{\textbf{Left:} WikiText-103 test perplexity (zoomed axis). Gradient-boosted attention outperforms all baselines including Twicing and a parameter-matched wider model. \textbf{Right:} Retrieval accuracy on the synthetic denoising task as a function of boosting rounds. The jump from 1 to 2 rounds captures most of the improvement.}
+\caption{\textbf{Left:} WikiText-103 test perplexity (zoomed axis). Gradient-boosted attention outperforms all baselines including Twicing and a parameter-matched wider model. \textbf{Right:} Retrieval accuracy on the synthetic pattern retrieval task as a function of boosting rounds. The dotted line marks the Bayes-optimal ceiling (58.4\%). Four rounds nearly match it (58.1\%); the jump from 1 to 2 rounds captures most of the improvement.}
 \label{fig:results}
 \end{figure}
 
@@ -500,24 +508,25 @@ This is consistent with the observation of \citet{he2016identity} that pre-activ
 \subsection{Ablation Studies}
 \label{sec:ablations}
 
-We conduct ablations on the synthetic pattern denoising task ($d = 64$, $K = 16$ patterns, noise $\sigma = 0.5$) where the mechanism is most transparent.
+We conduct ablations on the synthetic pattern retrieval task ($d = 64$, $K = 16$ patterns, noise $\sigma = 0.5$) where the mechanism is most transparent.
 
 \paragraph{Number of boosting rounds.}
 Table~\ref{tab:rounds} shows retrieval accuracy as a function of $M$.
-The jump from 1 to 2 rounds ($+13.5$ percentage points) accounts for the vast majority of the improvement.
-Additional rounds yield diminishing returns, with accuracy plateauing around $M{=}4$.
+The Bayes-optimal predictor (58.4\%) provides an analytical ceiling.
+The jump from 1 to 2 rounds ($+9.5$ percentage points) accounts for the vast majority of the improvement, bringing accuracy from 46.0\% to 55.5\%---closing most of the gap to Bayes-optimal.
+Additional rounds yield diminishing returns, with 4 rounds (58.1\%) nearly matching the Bayes-optimal ceiling.
 This mirrors the well-known behavior of gradient boosting with strong base learners \citep{friedman2001greedy}, where early rounds capture the dominant signal and later rounds offer marginal gains.
 
 \begin{table}[t]
 \centering
-\caption{Effect of boosting rounds on pattern retrieval accuracy (\%). Synthetic denoising task, $d=64$, $K=16$, $\sigma=0.5$.}
+\caption{Effect of boosting rounds on pattern retrieval accuracy (\%). Synthetic pattern retrieval task, $d=64$, $K=16$, $\sigma=0.5$. Bayes-optimal ceiling: 58.4\%.}
 \label{tab:rounds}
 \begin{tabular}{@{}lccccc@{}}
 \toprule
 \textbf{Rounds ($M$)} & 1 & 2 & 3 & 4 & 5 \\
 \midrule
-Accuracy (\%) & 41.3 & 54.8 & 55.1 & 56.4 & 55.8 \\
-$\Delta$ from $M{=}1$ & --- & +13.5 & +13.8 & +15.1 & +14.5 \\
+Accuracy (\%) & 46.0 & 55.5 & 57.6 & 58.1 & 57.0 \\
+$\Delta$ from $M{=}1$ & --- & +9.5 & +11.6 & +12.1 & +11.0 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -536,15 +545,15 @@ More broadly, the narrow spread across gate types confirms that the residual-att
 \toprule
 \textbf{Gate type} & None & Scalar & MLP & Baseline ($M{=}1$) \\
 \midrule
-Accuracy (\%) & 54.3 & 55.0 & 55.2 & 48.3 \\
-$\Delta$ from baseline & +6.0 & +6.7 & +6.9 & --- \\
+Accuracy (\%) & 55.4 & 56.5 & 55.6 & 48.2 \\
+$\Delta$ from baseline & +7.2 & +8.3 & +7.4 & --- \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \paragraph{Scaling with problem difficulty.}
 The benefit of boosting grows with problem difficulty.
-Across configurations ranging from $(d{=}32, K{=}8)$ to $(d{=}128, K{=}32)$, the improvement over the single-round baseline increases with the number of patterns and with moderate noise levels ($\sigma \leq 0.5$): at $\sigma{=}0.3$ the gain reaches $+18.7$ percentage points for $(d{=}64, K{=}16)$ and $+15.7$ for $(d{=}128, K{=}32)$, compared with $+1.9$ for $(d{=}32, K{=}8)$.
+Across configurations ranging from $(d{=}32, K{=}8)$ to $(d{=}128, K{=}32)$, the improvement over the single-round baseline increases with the number of patterns and with moderate noise levels ($\sigma \leq 0.5$): at $\sigma{=}0.3$ the gain reaches $+17.8$ percentage points for $(d{=}64, K{=}16)$ and $+14.6$ for $(d{=}32, K{=}8)$, with $+13.5$ for $(d{=}128, K{=}32)$.
 This is precisely the regime where the initial attention pass makes systematic but correctable errors---where gradient boosting is most effective (full breakdown in Figure~\ref{fig:scaling_ablation}, Appendix~\ref{app:scaling}).
 
 
@@ -554,11 +563,13 @@ This is precisely the regime where the initial attention pass makes systematic b
 We analyze the trained gradient-boosted models to understand what the correction round learns and where it helps most.
 
 \paragraph{Gate values across layers.}
-Figure~\ref{fig:gate_analysis} shows the learned per-dimension gate values, averaged over test sequences, for each of the four transformer layers.
+The gate is an input-dependent MLP that maps the current cumulative output and correction to a per-dimension mask in $[0, 1]$.
+Figure~\ref{fig:gate_analysis} shows the distribution of these gate activations across dimensions, averaged over 50 test sequences, for each of the four transformer layers.
 Layer~0 is the most conservative (mean gate value $0.33$, standard deviation $0.08$), admitting only a modest fraction of the correction.
 Layer~1 uses the correction most aggressively (mean $0.49$) and exhibits the highest variance across dimensions ($\sigma = 0.22$), indicating that some dimensions rely heavily on the correction while others suppress it.
 Layers~2 and~3 fall in between ($0.39$ and $0.36$, respectively).
-The per-dimension variation across all layers confirms that the gate is performing non-trivial, dimension-specific shrinkage rather than acting as a uniform scalar---consistent with the per-dimension generalization of the MART shrinkage parameter $\eta_m$ described in Section~\ref{sec:mart_connection}.
+When given the capacity, the gate learns non-trivial, dimension-specific shrinkage consistent with the per-dimension generalization of the MART shrinkage parameter $\eta_m$ described in Section~\ref{sec:mart_connection}.
+However, as the ablation in Section~\ref{sec:ablations} shows, a single scalar gate achieves comparable accuracy---the separate projections can absorb per-dimension adjustment when the gate cannot provide it.
 
 \begin{figure}[t]
 \centering
@@ -587,31 +598,32 @@ This confirms that the correction round's separate projections produce represent
 \end{figure}
 
 \paragraph{Attention entropy.}
-Figure~\ref{fig:attention_entropy} compares the entropy of the attention distributions between round~0 and round~1.
-Across all layers and heads, the correction round exhibits 22\% lower entropy on average (3.31 vs.\ 2.58 nats), indicating that it attends more selectively than the initial round.
-The per-layer breakdown reveals depth-dependent behavior: in layer~0, the correction round actually has slightly \emph{higher} entropy than the initial round, consistent with its conservative gate (mean $0.33$) allowing only a small fraction of a broadly-spread correction through.
-In layers~1 and~2, the correction round is sharply focused (entropy drops by 55\% and 39\%, respectively), and these are also the layers where the gate admits the most correction (means $0.49$ and $0.39$).
-This correlation between attention sharpness and gate openness suggests that the model learns to rely on the correction most when it can be made precise.
+Figure~\ref{fig:attention_entropy} compares the entropy of each query's attention distribution across three settings: standard attention, and rounds~0 and~1 of the boosted model.
+The comparison reveals a learned division of labor.
+Round~0 of the boosted model is consistently \emph{more diffuse} than standard attention (mean 3.34 vs.\ 2.71 nats), while round~1 is more focused (2.55 nats).
+The boosted model's initial round spreads attention more broadly than a standalone model would, delegating the sharpening to the correction round.
+This effect is strongest in layer~1, where round~0 entropy exceeds standard by 27\% while round~1 drops 45\% below standard, and coincides with the highest gate values (Figure~\ref{fig:gate_analysis}).
+The correlation between attention sharpness and gate openness suggests that the model learns to rely on the correction most when it can be made precise.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\textwidth]{fig_attention_entropy.pdf}
-\caption{\textbf{Left:} Distribution of attention entropy across all layers and heads for round~0 (initial) and round~1 (correction). The correction round is 22\% lower-entropy on average. \textbf{Right:} Mean entropy per layer. Layers~1--2 show the sharpest correction attention, coinciding with higher gate values (Figure~\ref{fig:gate_analysis}).}
+\caption{\textbf{Left:} Distribution of attention entropy across all layers and heads for standard attention, boosted round~0, and boosted round~1. Round~0 is more diffuse than standard; round~1 is more focused. \textbf{Right:} Mean entropy per layer. The boosted model learns a division of labor: round~0 casts a wider net than standard attention, while round~1 sharpens, especially in layers~1--2.}
 \label{fig:attention_entropy}
 \end{figure}
 
 \paragraph{Example-level corrections.}
-The aggregate statistics above show that the correction round attends more sharply; Figure~\ref{fig:examples} illustrates this on individual predictions.
-We select three tokens (from different articles) where the boosted model dramatically outperforms standard attention, and overlay the head-averaged attention weights for round~0 and round~1 in layer~1.
-In each case, round~0 distributes attention relatively uniformly across context tokens, while round~1 concentrates on the tokens most relevant to the target.
-For instance, when predicting the continuation of ``Ke'' (target: ``iser,'' completing the name Keiser), round~1 places its highest weight on the preceding token ``Ke'' and the nearby geographical context, while standard attention predicts ``ong'' (confused by the earlier substring ``Yongsan'').
-Similarly, for ``iron @-@ h'' $\to$ ``ul'' (completing ``hull''), round~1 attends sharply to ``iron,'' the hyphen, and ``h''---the compound being constructed---while standard attention predicts the wrong subword.
+Figure~\ref{fig:examples} illustrates this division of labor on individual predictions, showing the head-averaged attention in layer~1 for standard attention, boosted round~0, and boosted round~1.
+We select two tokens from different articles where the boosted model dramatically outperforms standard attention.
+In each case, standard attention and round~0 spread weight broadly across context tokens, while round~1 concentrates sharply on the tokens most relevant to the target.
+For instance, when predicting the continuation of ``Ke'' (target: ``iser,'' completing the name Keiser), the correction round places its highest weight on ``Ke'' and the nearby geographical context, while standard attention predicts ``ong'' (confused by the earlier substring ``Yongsan'').
+Similarly, for ``iron @-@ h'' $\to$ ``ul'' (completing ``hull''), the correction round attends sharply to ``iron,'' the hyphen, and ``h,'' while standard attention predicts the wrong subword.
 These examples are selected from the top of the per-token improvement distribution (improvement $>4.8$ nats) and thus illustrate the best-case rather than the typical behavior; the overall improvement of $4.3$ perplexity points reflects the average across all tokens.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=0.85\textwidth]{fig_example_corrections.pdf}
-\caption{Three tokens where gradient-boosted attention corrects a prediction error. Blue bars show round~0 attention (initial, diffuse); red bars show round~1 attention (correction, concentrated on relevant context). Each title shows the target token, the standard model's prediction, and the boosted model's prediction with cross-entropy loss. Layer~1, head-averaged.}
+\caption{Two tokens where gradient-boosted attention corrects a prediction error. Blue bars show standard attention, gray bars show boosted round~0, and red bars show boosted round~1. Standard and round~0 spread weight broadly; round~1 concentrates on the most relevant context. Each title shows the target, the standard model's prediction, and the boosted model's prediction with cross-entropy loss. Layer~1, head-averaged.}
 \label{fig:examples}
 \end{figure}
 
@@ -681,7 +693,7 @@ Gradient boosting typically helps most when individual learners are moderately s
 Attention in small models may be in the ``moderately strong'' regime where boosting is maximally effective; whether this persists at scale is an empirical question.
 
 \paragraph{Future work.}
-Natural extensions include: (i) applying gradient-boosted attention as a drop-in replacement during fine-tuning of pretrained models, which requires no large-scale pretraining; (ii) combining with Differential Transformer for joint noise cancellation and error correction; (iii) learning the number of rounds per head or per layer, analogous to adaptive boosting; (iv) analyzing whether the correction round develops interpretable specialization across heads and layers.
+Natural extensions include: (i) applying gradient-boosted attention as a drop-in replacement during fine-tuning of pretrained models, which requires no large-scale pretraining; (ii) combining with Differential Transformer for joint noise cancellation and error correction; (iii) selectively applying boosting only at layers that benefit most, since the gate analysis (Section~\ref{sec:analysis}) shows that some layers barely use the correction while others rely on it heavily; (iv) analyzing whether the correction round develops interpretable specialization across heads and layers.
 
 \paragraph{Connection to normalization placement.}
 The finding that gradient-boosted attention requires Pre-LN placement connects our within-layer mechanism to a broader structural principle.
@@ -752,21 +764,39 @@ Weight tying & Yes (embedding = output projection) \\
 \midrule
 Hardware & 1$\times$ NVIDIA RTX 2000 Ada (16GB) (WikiText-103) \\
  & 1$\times$ NVIDIA A100 80GB (OpenWebText, Post-LN) \\
- & Apple M1 Pro (MPS) (synthetic ablations) \\
+ & Apple M1 (MPS) (synthetic ablations) \\
 Training time per run & ${\sim}$30 min (RTX 2000), ${\sim}$10 min (A100) \\
 Random seeds & 42, 123 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\section{Synthetic Denoising Task Details}
+\section{Convergence Speed}
+\label{app:convergence}
+
+Figure~\ref{fig:convergence} plots validation perplexity on WikiText-103 across epochs for all four models (averaged over two seeds).
+Gradient-boosted attention reaches the parameter-fair baseline's final perplexity ($69.6$) by epoch~12, while the baseline itself requires all 15 epochs---20\% fewer optimizer steps.
+It reaches the standard model's final perplexity ($72.2$) by epoch~10, a 33\% reduction.
+Note that each training step is more expensive for the boosted model due to the second attention round; this comparison measures convergence in optimizer steps, not FLOPs or wall-clock time.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.65\textwidth]{fig_convergence.pdf}
+\caption{Validation perplexity on WikiText-103 across training epochs (mean of 2 seeds). The dashed line marks the parameter-fair baseline's final perplexity. Gradient-boosted attention reaches this level 3 epochs earlier (20\% fewer optimizer steps), despite starting from a comparable first epoch.}
+\label{fig:convergence}
+\end{figure}
+
+
+\section{Synthetic Pattern Retrieval Task Details}
 \label{app:denoising}
 
-The negative results (Section~\ref{sec:negative}) and ablation studies (Section~\ref{sec:ablations}) use a synthetic pattern denoising task.
-$K$ unit-normalized patterns are sampled uniformly from $\mathbb{R}^d$.
-Queries are generated by selecting a pattern uniformly at random and adding isotropic Gaussian noise with standard deviation $\sigma$.
+The negative results (Section~\ref{sec:negative}) and ablation studies (Section~\ref{sec:ablations}) use a synthetic pattern retrieval task.
+$K$ unit-normalized patterns $\mathbf{p}_1, \ldots, \mathbf{p}_K \in \mathbb{R}^d$ are sampled uniformly from the unit sphere.
+A query is generated by selecting a pattern $\mathbf{p}_j$ uniformly at random and adding isotropic Gaussian noise: $\tilde{\mathbf{x}} = \mathbf{p}_j + \boldsymbol{\varepsilon}$, $\boldsymbol{\varepsilon} \sim \mathcal{N}(\mathbf{0}, \sigma^2 \mathbf{I})$.
 Retrieval accuracy is the fraction of queries for which the nearest stored pattern (by Euclidean distance) to the model's output matches the generating pattern.
-All synthetic experiments use cosine similarity plus cross-entropy classification as the training loss, Adam optimizer with learning rate $3 \times 10^{-3}$, batch size 512, and 150 training epochs.
+All synthetic experiments use mean squared error $\|\hat{\mathbf{x}} - \mathbf{p}_j\|^2$ as the training loss---consistent with the squared reconstruction objective underlying the MART framework (Section~\ref{sec:theory})---with Adam optimizer, learning rate $3 \times 10^{-3}$, batch size 512, and 150 training epochs.
+Under this setup the task admits a closed-form Bayes-optimal predictor \citep{smart2025incontext}: $f_{\mathrm{opt}}(\tilde{\mathbf{x}}) = \sum_k \mathbf{p}_k \exp(\langle \mathbf{p}_k, \tilde{\mathbf{x}} \rangle / \sigma^2) / \sum_k \exp(\langle \mathbf{p}_k, \tilde{\mathbf{x}} \rangle / \sigma^2)$, which is softmax attention over the patterns with temperature $\beta = 1/\sigma^2$ and identity projections.
+We report this baseline alongside the trained models.
 
 \subsection{Scaling Across Configurations}
 \label{app:scaling}
@@ -778,7 +808,7 @@ At very high noise ($\sigma \geq 0.8$), even the base learner's errors become di
 \begin{figure}[h]
 \centering
 \includegraphics[width=\textwidth]{fig_scaling_ablation.pdf}
-\caption{Retrieval accuracy for standard vs.\ gradient-boosted attention ($M{=}2$, MLP gate) across configurations. Numbers above bars indicate the accuracy improvement in percentage points. The benefit of boosting increases with problem dimensionality and is largest at moderate noise levels.}
+\caption{Retrieval accuracy for standard vs.\ gradient-boosted attention ($M{=}2$, MLP gate) across configurations, with the Bayes-optimal ceiling shown for reference. Numbers above bars indicate the accuracy improvement in percentage points. Boosted attention closes most of the gap to the Bayes-optimal ceiling, especially at moderate noise levels ($\sigma \leq 0.5$).}
 \label{fig:scaling_ablation}
 \end{figure}
 
@@ -809,7 +839,7 @@ Original input $\mathbf{x}$ & $69.3$ & $69.5$ \\
 
 Deriving all three projections from the residual yields 1.4 points lower perplexity (Table~\ref{tab:kv_source}).
 We hypothesize that this is because the residual-derived keys and values allow the correction round to operate entirely within the residual subspace, producing value vectors $\mathbf{V}' = \mathbf{W}_V^{(1)}\mathbf{r}$ that are tailored to the error signal rather than the original representation.
-This is consistent with Proposition~\ref{prop:separate}: since $\mathbf{V}'$ spans a different subspace than $\mathbf{V}^{(0)} = \mathbf{W}_V^{(0)}\mathbf{x}$, the gated correction can escape $\mathrm{conv}(\mathbf{V}^{(0)})$, whereas deriving values from $\mathbf{x}$ constrains the correction to the same representational space as round~0.
+This is consistent with Proposition~\ref{prop:separate}: since $\mathbf{V}' = \mathbf{W}_V^{(1)}\mathbf{r}$ spans a different subspace than $\mathbf{V}^{(0)} = \mathbf{W}_V^{(0)}\mathbf{x}$, the correction operates in a representation space distinct from round~0, whereas deriving values from $\mathbf{x}$ constrains both rounds to the same representational space.
 Our implementation supports both variants via a \texttt{kv\_source} flag.
 
 
@@ -817,12 +847,12 @@ Our implementation supports both variants via a \texttt{kv\_source} flag.
 \label{app:convex_hull}
 
 To quantify the convex hull escape reported in Section~\ref{sec:analysis}, we compute the exact $\ell_2$ distance from the boosted output to $\mathrm{conv}(\mathbf{V}^{(0)})$ for individual attention heads.
-Let $\mathbf{p} \in \mathbb{R}^{d_h}$ denote the boosted output for a single head at position $t$, and let $\mathbf{v}_1^{(0)}, \ldots, \mathbf{v}_t^{(0)} \in \mathbb{R}^{d_h}$ denote the round-0 value vectors for the same head at positions $1$ through $t$ (respecting the causal mask).
+Let $\mathbf{o} \in \mathbb{R}^{d_h}$ denote the boosted output for a single head at position $t$, and let $\mathbf{v}_1^{(0)}, \ldots, \mathbf{v}_t^{(0)} \in \mathbb{R}^{d_h}$ denote the round-0 value vectors for the same head at positions $1$ through $t$ (respecting the causal mask).
 We find the nearest point in the convex hull by solving:
 \begin{equation}
-    d\!\left(\mathbf{p},\; \mathrm{conv}(\mathbf{V}^{(0)})\right) = \min_{\boldsymbol{\alpha} \in \mathbb{R}^t} \left\| \mathbf{p} - \sum_{i=1}^{t} \alpha_i \, \mathbf{v}_i^{(0)} \right\|_2 \quad \text{s.t.} \quad \alpha_i \geq 0 \;\;\forall i, \quad \sum_{i=1}^{t} \alpha_i = 1.
+    d\!\left(\mathbf{o},\; \mathrm{conv}(\mathbf{V}^{(0)})\right) = \min_{\boldsymbol{\alpha} \in \mathbb{R}^t} \left\| \mathbf{o} - \sum_{i=1}^{t} \alpha_i \, \mathbf{v}_i^{(0)} \right\|_2 \quad \text{s.t.} \quad \alpha_i \geq 0 \;\;\forall i, \quad \sum_{i=1}^{t} \alpha_i = 1.
 \end{equation}
-This is a convex quadratic program with $t$ variables, one equality constraint, and $t$ nonnegativity constraints.
+This is a convex quadratic program (QP) with $t$ variables, one equality constraint, and $t$ nonnegativity constraints.
 We solve it using Sequential Least-Squares Programming (SLSQP) via \texttt{scipy.optimize.minimize}, initialized at the uniform distribution $\alpha_i = 1/t$.
 For computational tractability, we restrict to positions $t \leq 64$, limiting each QP to at most 64 variables.
 For each of the four transformer layers, we uniformly sample 600 (position, head) pairs from 30 randomly selected test sequences.

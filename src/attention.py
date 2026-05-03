@@ -222,6 +222,16 @@ class CausalAttention(nn.Module):
         self.W_out = nn.Linear(d_model, d_model)
         self.attn_drop = nn.Dropout(dropout)
         self.scale = self.d_head ** -0.5
+        self.capturing = False
+        self._cached = {}
+
+    def enable_capture(self):
+        self.capturing = True
+        self._cached = {'attn': []}
+
+    def disable_capture(self):
+        self.capturing = False
+        self._cached = {}
 
     def forward(self, x):
         B, T, D = x.shape
@@ -232,6 +242,8 @@ class CausalAttention(nn.Module):
         mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
         attn.masked_fill_(mask, float('-inf'))
         attn = self.attn_drop(F.softmax(attn, dim=-1))
+        if self.capturing:
+            self._cached['attn'] = [attn.detach()]
         out = (attn @ v).transpose(1, 2).reshape(B, T, D)
         return self.W_out(out)
 

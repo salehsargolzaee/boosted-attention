@@ -176,6 +176,36 @@ class OneStepBaseline(nn.Module):
         return out, weights
 
 
+class HopfieldConvergedBaseline(nn.Module):
+    """Converged baseline by unrolling N Hopfield iterations with backprop."""
+    def __init__(self, d, d_hidden=None, beta_init=2.0, n_iters=20):
+        super().__init__()
+        d_hidden = d_hidden or d
+        self.W_q = nn.Linear(d, d_hidden, bias=False)
+        self.W_k = nn.Linear(d, d_hidden, bias=False)
+        self.W_v = nn.Linear(d, d, bias=False)
+        self.log_beta = nn.Parameter(torch.tensor(float(beta_init)).log())
+        self.n_iters = n_iters
+
+    @property
+    def beta(self):
+        return self.log_beta.exp()
+
+    def forward(self, query, patterns, return_details=False):
+        k = self.W_k(patterns)
+        v = self.W_v(patterns)
+        q0 = self.W_q(query)
+        logits0 = self.beta * (q0 @ k.T)
+        w0 = F.softmax(logits0, dim=-1)
+        z = w0 @ v
+        for _ in range(self.n_iters - 1):
+            qp = self.W_q(z)
+            logits = self.beta * (qp @ k.T)
+            w = F.softmax(logits, dim=-1)
+            z = w @ v
+        return z, None
+
+
 class DEQConvergedBaseline(nn.Module):
     """Converged-only baseline using DEQ."""
     def __init__(self, d, d_hidden=None, beta_init=2.0, deq_max_iter=30, deq_tol=1e-5):
@@ -214,7 +244,7 @@ class DEQConvergedBaseline(nn.Module):
         return z_star_list[0], info
 
 
-def train_and_evaluate(d, K, noise_std, epochs=120, lr=3e-3, batch_size=512,
+def train_and_evaluate(d, K, noise_std, epochs=150, lr=3e-3, batch_size=512,
                        n_train=20000, n_val=5000, device=DEVICE):
     """Train all three models and compare."""
 
@@ -236,9 +266,7 @@ def train_and_evaluate(d, K, noise_std, epochs=120, lr=3e-3, batch_size=512,
         queries = targets + noise_std * torch.randn(batch_size, d, device=device)
 
         out, weights = model_1step(queries, patterns)
-        cos_loss = 1 - F.cosine_similarity(out, targets).mean()
-        cls_loss = F.cross_entropy(weights, tidx.to(device))
-        loss = cos_loss + 0.5 * cls_loss
+        loss = F.mse_loss(out, targets)
 
         opt1.zero_grad()
         loss.backward()
@@ -259,8 +287,42 @@ def train_and_evaluate(d, K, noise_std, epochs=120, lr=3e-3, batch_size=512,
 
     results["one_step"] = {"model": model_1step}
 
-    # ====== Model 2: DEQ converged baseline ======
-    print(f"\n  [2/3] Training DEQ converged baseline...")
+    # ====== Model 2: Hopfield converged (backprop through iterations) ======
+    print(f"\n  [2/4] Training Hopfield converged (20 iterations, backprop)...")
+    model_hopfield = HopfieldConvergedBaseline(d, beta_init=2.0, n_iters=20).to(device)
+    opt_h = torch.optim.Adam(model_hopfield.parameters(), lr=lr)
+    sched_h = torch.optim.lr_scheduler.CosineAnnealingLR(opt_h, T_max=epochs)
+
+    for epoch in range(epochs):
+        model_hopfield.train()
+        tidx = torch.randint(K, (batch_size,))
+        targets = patterns[tidx]
+        queries = targets + noise_std * torch.randn(batch_size, d, device=device)
+
+        out, _ = model_hopfield(queries, patterns)
+        loss = F.mse_loss(out, targets)
+
+        opt_h.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(model_hopfield.parameters(), 1.0)
+        opt_h.step()
+        sched_h.step()
+
+        if (epoch + 1) % 30 == 0:
+            model_hopfield.eval()
+            with torch.no_grad():
+                tidx_v = torch.randint(K, (n_val,))
+                tgt_v = patterns[tidx_v]
+                qry_v = tgt_v + noise_std * torch.randn(n_val, d, device=device)
+                out_v, _ = model_hopfield(qry_v, patterns)
+                dists = torch.cdist(out_v.unsqueeze(0), patterns.unsqueeze(0)).squeeze(0)
+                acc = (dists.argmin(dim=-1) == tidx_v.to(device)).float().mean().item() * 100
+            print(f"    Epoch {epoch+1}: acc={acc:.1f}%, beta={model_hopfield.beta.item():.2f}")
+
+    results["hopfield_converged"] = {"model": model_hopfield}
+
+    # ====== Model 3: DEQ converged baseline ======
+    print(f"\n  [3/4] Training DEQ converged baseline...")
     model_conv = DEQConvergedBaseline(d, beta_init=2.0).to(device)
     opt2 = torch.optim.Adam(model_conv.parameters(), lr=lr)
     sched2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=epochs)
@@ -272,7 +334,7 @@ def train_and_evaluate(d, K, noise_std, epochs=120, lr=3e-3, batch_size=512,
         queries = targets + noise_std * torch.randn(batch_size, d, device=device)
 
         out, info = model_conv(queries, patterns)
-        loss = 1 - F.cosine_similarity(out, targets).mean()
+        loss = F.mse_loss(out, targets)
 
         opt2.zero_grad()
         loss.backward()
@@ -293,8 +355,8 @@ def train_and_evaluate(d, K, noise_std, epochs=120, lr=3e-3, batch_size=512,
 
     results["converged_deq"] = {"model": model_conv}
 
-    # ====== Model 3: DEQ Dual-Path with learned gate ======
-    print(f"\n  [3/3] Training DEQ dual-path (our method)...")
+    # ====== Model 4: DEQ Dual-Path with learned gate ======
+    print(f"\n  [4/4] Training DEQ dual-path (gated)...")
     model_dual = DEQDualPathDenoiser(d, beta_init=2.0, gate_hidden=32).to(device)
     opt3 = torch.optim.Adam(model_dual.parameters(), lr=lr)
     sched3 = torch.optim.lr_scheduler.CosineAnnealingLR(opt3, T_max=epochs)
@@ -307,11 +369,10 @@ def train_and_evaluate(d, K, noise_std, epochs=120, lr=3e-3, batch_size=512,
 
         output, out_shallow, out_deep = model_dual(queries, patterns)
 
-        # Combined loss: supervise all three outputs
-        cos_merged = 1 - F.cosine_similarity(output, targets).mean()
-        cos_shallow = 1 - F.cosine_similarity(out_shallow, targets).mean()
-        cos_deep = 1 - F.cosine_similarity(out_deep, targets).mean()
-        loss = cos_merged + 0.3 * cos_shallow + 0.3 * cos_deep
+        loss_merged = F.mse_loss(output, targets)
+        loss_shallow = F.mse_loss(out_shallow, targets)
+        loss_deep = F.mse_loss(out_deep, targets)
+        loss = loss_merged + 0.3 * loss_shallow + 0.3 * loss_deep
 
         opt3.zero_grad()
         loss.backward()
@@ -340,41 +401,49 @@ def train_and_evaluate(d, K, noise_std, epochs=120, lr=3e-3, batch_size=512,
     print(f"\n  --- Final Evaluation ---")
     eval_results = {}
 
+    # Shared eval data (same for all models)
+    torch.manual_seed(999)
+    tidx_v = torch.randint(K, (n_val,))
+    tgt_v = patterns[tidx_v]
+    qry_v = tgt_v + noise_std * torch.randn(n_val, d, device=device)
+
+    # Bayes optimal baseline: softmax attention with β = 1/σ², W = I
+    # f_opt(x̃) = Σ_j p_j exp(⟨p_j, x̃⟩/σ²) / Σ_j exp(⟨p_j, x̃⟩/σ²)
+    with torch.no_grad():
+        beta_opt = 1.0 / (noise_std ** 2)
+        logits_opt = beta_opt * (qry_v @ patterns.T)  # (n_val, K)
+        weights_opt = F.softmax(logits_opt, dim=-1)
+        out_opt = weights_opt @ patterns  # (n_val, d)
+        dists_opt = torch.cdist(out_opt.unsqueeze(0), patterns.unsqueeze(0)).squeeze(0)
+        acc_opt = (dists_opt.argmin(dim=-1) == tidx_v.to(device)).float().mean().item() * 100
+        mse_opt = (out_opt - tgt_v).pow(2).mean().item()
+        eval_results["bayes_optimal"] = {"acc": acc_opt, "mse": mse_opt}
+        print(f"  {'bayes_optimal':20s}: acc={acc_opt:.1f}%  mse={mse_opt:.6f}")
+
     for name, res in results.items():
         model = res["model"]
         model.eval()
         with torch.no_grad():
-            tidx_v = torch.randint(K, (n_val,))
-            tgt_v = patterns[tidx_v]
-            qry_v = tgt_v + noise_std * torch.randn(n_val, d, device=device)
-
-            if name == "one_step":
-                out_v, weights_v = model(qry_v, patterns)
-            elif name == "converged_deq":
-                out_v, _ = model(qry_v, patterns)
-            elif name == "dual_path_deq":
+            if name == "dual_path_deq":
                 details = model(qry_v, patterns, return_details=True)
                 out_v = details["output"]
+            else:
+                out_v, _ = model(qry_v, patterns)
 
             # Accuracy
             dists = torch.cdist(out_v.unsqueeze(0), patterns.unsqueeze(0)).squeeze(0)
             acc = (dists.argmin(dim=-1) == tidx_v.to(device)).float().mean().item() * 100
             # MSE
             mse = (out_v - tgt_v).pow(2).mean().item()
-            # Cosine
-            cos = F.cosine_similarity(out_v, tgt_v).mean().item()
 
-            eval_results[name] = {"acc": acc, "mse": mse, "cosine": cos}
-            print(f"  {name:20s}: acc={acc:.1f}%  mse={mse:.6f}  cos={cos:.4f}")
+            eval_results[name] = {"acc": acc, "mse": mse}
+            print(f"  {name:20s}: acc={acc:.1f}%  mse={mse:.6f}")
 
-    # Detailed dual-path analysis
+    # Detailed dual-path analysis (reuses same eval data)
     if "dual_path_deq" in results:
         model = results["dual_path_deq"]["model"]
         model.eval()
         with torch.no_grad():
-            tidx_v = torch.randint(K, (n_val,))
-            tgt_v = patterns[tidx_v]
-            qry_v = tgt_v + noise_std * torch.randn(n_val, d, device=device)
             details = model(qry_v, patterns, return_details=True)
 
             # Per-path accuracy
@@ -429,7 +498,7 @@ def run_full_comparison():
         print(f"\n{'='*60}")
         print(f"  {label}")
         print(f"{'='*60}")
-        eval_results, _ = train_and_evaluate(d, K, noise_std, epochs=120)
+        eval_results, _ = train_and_evaluate(d, K, noise_std, epochs=150)
         all_results[label] = eval_results
 
     return all_results
@@ -504,17 +573,15 @@ if __name__ == "__main__":
     plot_comparison(all_results)
 
     # Save summary
-    summary = {}
-    for label, res in all_results.items():
-        summary[label] = {k: v for k, v in res.items() if k != "model" and not isinstance(v, dict) or k == "dual_breakdown"}
-    # Clean for JSON serialization
     clean_summary = {}
     for label, res in all_results.items():
         clean_summary[label] = {}
-        for method in ["one_step", "converged_deq", "dual_path_deq", "dual_breakdown"]:
-            if method in res:
-                clean_summary[label][method] = {k: v for k, v in res[method].items()
-                                                  if not isinstance(v, torch.nn.Module)}
+        for method in res:
+            if isinstance(res[method], dict):
+                clean_summary[label][method] = {
+                    k: v for k, v in res[method].items()
+                    if not isinstance(v, torch.nn.Module)
+                }
     with open(RESULTS_DIR / "exp11_summary.json", "w") as f:
         json.dump(clean_summary, f, indent=2)
 

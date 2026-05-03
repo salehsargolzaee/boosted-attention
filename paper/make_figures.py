@@ -189,24 +189,32 @@ def fig_results():
     ax.grid(axis='y', alpha=0.2, ls='--')
     ax.set_title('WikiText-103 Test Perplexity', fontsize=11, fontweight='bold')
 
-    # ---- Right: ablation rounds ----
+    # ---- Right: ablation rounds (read from JSON) ----
     ax = ax2
-    rounds = [1, 2, 3, 4, 5]
-    accs = [41.3, 54.8, 55.1, 56.4, 55.8]
+    with open(RESULTS_DIR / 'exp_ablations.json') as f:
+        abl = json.load(f)
+    abl_rounds = abl['ablation_rounds']
+    rounds = sorted(int(k) for k in abl_rounds if k != 'bayes_optimal')
+    accs = [abl_rounds[str(r)]['acc'] for r in rounds]
+    bayes_acc = abl_rounds['bayes_optimal']['acc']
 
     ax.plot(rounds, accs, 'o-', color=C_BOOST, lw=2.5, ms=8, zorder=3)
     ax.fill_between(rounds, 38, accs, alpha=0.08, color=C_BOOST)
-    ax.axhline(41.3, color=C_STD, ls='--', lw=1, alpha=0.6, label='1-round baseline')
+    ax.axhline(accs[0], color=C_STD, ls='--', lw=1, alpha=0.6, label='1-round baseline')
+    ax.axhline(bayes_acc, color='#8e44ad', ls=':', lw=1.5, alpha=0.8,
+               label=f'Bayes optimal ({bayes_acc:.1f}%)')
 
-    ax.annotate('+13.5 pp', xy=(1.55, 47.5), fontsize=9, fontweight='bold', color=C_BOOST)
+    delta_max = max(accs) - accs[0]
+    ax.annotate(f'+{delta_max:.1f} pp', xy=(1.55, (accs[0] + accs[1]) / 2),
+                fontsize=9, fontweight='bold', color=C_BOOST)
 
     ax.set_xlabel('Boosting Rounds ($M$)')
     ax.set_ylabel('Retrieval Accuracy (%)')
     ax.set_xticks(rounds)
-    ax.set_ylim(38, 60)
+    ax.set_ylim(38, 62)
     ax.legend(loc='lower right', fontsize=8)
     ax.grid(True, alpha=0.2, ls='--')
-    ax.set_title('Ablation: Rounds (denoising)', fontsize=11, fontweight='bold')
+    ax.set_title('Ablation: Rounds (pattern retrieval)', fontsize=11, fontweight='bold')
 
     plt.tight_layout()
     for ext in ['pdf', 'png']:
@@ -314,7 +322,53 @@ def fig_convex_hull():
 
 
 # ============================================================
-# Figure 5: Scaling ablation across (d, K, sigma) configs
+# Figure 5: Convergence speed
+# ============================================================
+
+C_TWICE = '#8e44ad'
+
+def fig_convergence():
+    import torch
+
+    models = [
+        ('Standard', C_STD, '--'),
+        ('Boosted-2', C_BOOST, '-'),
+        ('Twicing', C_TWICE, '-.'),
+        ('Std-fair(d=288)', C_FAIR, ':'),
+    ]
+    labels = ['Standard', 'Boosted ($M{=}2$)', 'Twicing', 'Std-fair ($d{=}288$)']
+
+    fig, ax = plt.subplots(figsize=(5, 3.2))
+
+    for (name, color, ls), label in zip(models, labels):
+        curves = []
+        for seed in [42, 123]:
+            path = RESULTS_DIR / f'checkpoints/small_{name}_seed{seed}.pt'
+            ckpt = torch.load(path, map_location='cpu', weights_only=False)
+            curves.append(ckpt['history']['val_ppl'])
+        mean = np.mean(curves, axis=0)
+        epochs = np.arange(1, len(mean) + 1)
+        ax.plot(epochs, mean, ls, color=color, lw=2, label=label, marker='o', ms=4)
+
+    fair_final = 69.6
+    ax.axhline(fair_final, color=C_FAIR, ls='--', lw=0.8, alpha=0.5)
+    ax.annotate('Std-fair final (69.6)', xy=(3, fair_final - 0.6),
+                fontsize=7, color=C_FAIR, alpha=0.8)
+
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Validation Perplexity')
+    ax.set_xticks(range(1, 16))
+    ax.set_ylim(65, 120)
+    ax.legend(fontsize=7.5, loc='upper right')
+    ax.grid(True, alpha=0.2, ls='--')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    plt.tight_layout()
+    _save('fig_convergence')
+
+
+# ============================================================
+# Figure 6: Scaling ablation across (d, K, sigma) configs
 # ============================================================
 
 def fig_scaling_ablation():
@@ -331,12 +385,14 @@ def fig_scaling_ablation():
                 sigma = float(key.split('s=')[1])
                 dim_configs[d][sigma] = val
 
+    C_BAYES = '#8e44ad'
     fig, axes = plt.subplots(1, 3, figsize=(11, 3.2), sharey=True)
     for ax, d in zip(axes, dims):
         sigmas = sorted(dim_configs[d].keys())
-        deltas = [dim_configs[d][s]['delta'] for s in sigmas]
         baselines = [dim_configs[d][s]['baseline'] for s in sigmas]
         boosteds = [dim_configs[d][s]['boosted'] for s in sigmas]
+        bayes_opts = [dim_configs[d][s].get('bayes_optimal', 0) for s in sigmas]
+        deltas = [dim_configs[d][s]['delta'] for s in sigmas]
 
         for key in configs:
             if key.startswith(f'd={d},'):
@@ -344,13 +400,14 @@ def fig_scaling_ablation():
                 break
 
         x = np.arange(len(sigmas))
-        w = 0.35
-        bars_b = ax.bar(x - w/2, baselines, w, label='Standard', color=C_STD, alpha=0.8)
-        bars_bo = ax.bar(x + w/2, boosteds, w, label='Boosted', color=C_BOOST, alpha=0.8)
+        w = 0.25
+        ax.bar(x - w, baselines, w, label='Standard', color=C_STD, alpha=0.8)
+        ax.bar(x, boosteds, w, label='Boosted', color=C_BOOST, alpha=0.8)
+        ax.bar(x + w, bayes_opts, w, label='Bayes opt.', color=C_BAYES, alpha=0.5)
 
         for i, delta in enumerate(deltas):
-            y_top = max(baselines[i], boosteds[i])
-            ax.text(x[i] + w/2, y_top + 1.0, f'+{delta:.1f}',
+            y_top = max(baselines[i], boosteds[i], bayes_opts[i])
+            ax.text(x[i], y_top + 1.0, f'+{delta:.1f}',
                     ha='center', va='bottom', fontsize=7, fontweight='bold',
                     color=C_BOOST)
 
@@ -360,7 +417,7 @@ def fig_scaling_ablation():
         ax.grid(axis='y', alpha=0.2, ls='--')
         if ax == axes[0]:
             ax.set_ylabel('Retrieval Accuracy (%)', fontsize=9)
-            ax.legend(fontsize=8, loc='upper right')
+            ax.legend(fontsize=7, loc='upper right')
 
     plt.tight_layout()
     _save('fig_scaling_ablation')
@@ -377,4 +434,6 @@ if __name__ == '__main__':
         fig_convex_hull()
     if (RESULTS_DIR / 'exp_ablations.json').exists():
         fig_scaling_ablation()
+    if (RESULTS_DIR / 'checkpoints').exists():
+        fig_convergence()
     print('\nAll figures generated.')

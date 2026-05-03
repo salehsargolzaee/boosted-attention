@@ -19,6 +19,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from pathlib import Path
 import time
+import json
 
 from attention import BoostedAttention, StandardAttention, BoostedAttentionOutput
 
@@ -53,9 +54,7 @@ def train_and_eval(model, patterns, d, K, noise_std, epochs=150, lr=3e-3,
         queries = targets + noise_std * torch.randn(batch_size, d, device=device)
 
         output, weights, entropy = model(queries, patterns)
-        cos_loss = 1 - F.cosine_similarity(output, targets).mean()
-        cls_loss = F.cross_entropy(weights, tidx.to(device))
-        loss = cos_loss + 0.5 * cls_loss
+        loss = F.mse_loss(output, targets)
 
         opt.zero_grad()
         loss.backward()
@@ -76,6 +75,24 @@ def train_and_eval(model, patterns, d, K, noise_std, epochs=150, lr=3e-3,
     final_acc = eval_acc(model, patterns, d, K, noise_std, n_val, device)
     details = eval_detailed(model, patterns, d, K, noise_std, n_val, device)
     return max(best_acc, final_acc), details
+
+
+@torch.no_grad()
+def eval_bayes_optimal(patterns, K, noise_std, n=5000, device=DEVICE):
+    """Bayes optimal baseline: softmax attention with β=1/σ², W=I.
+    From Smart et al. (2025), Proposition 4 (σ₀→0 limit)."""
+    patterns = patterns.to(device)
+    tidx = torch.randint(K, (n,), device=device)
+    targets = patterns[tidx]
+    queries = targets + noise_std * torch.randn(n, patterns.shape[1], device=device)
+    beta_opt = 1.0 / (noise_std ** 2)
+    logits = beta_opt * (queries @ patterns.T)
+    weights = F.softmax(logits, dim=-1)
+    output = weights @ patterns
+    dists = torch.cdist(output.unsqueeze(0), patterns.unsqueeze(0)).squeeze(0)
+    acc = (dists.argmin(dim=-1) == tidx.to(device)).float().mean().item() * 100
+    mse = (output - targets).pow(2).mean().item()
+    return acc, mse
 
 
 @torch.no_grad()
@@ -158,7 +175,12 @@ def ablation_rounds(d=64, K=16, noise_std=0.5):
     torch.manual_seed(42)
     patterns = F.normalize(torch.randn(K, d), dim=-1)
 
+    # Bayes optimal baseline
+    acc_opt, mse_opt = eval_bayes_optimal(patterns, K, noise_std)
+    print(f"\n  Bayes optimal: acc={acc_opt:.1f}%, mse={mse_opt:.6f}")
+
     results = {}
+    results["bayes_optimal"] = {"acc": acc_opt, "mse": mse_opt}
     for n_rounds in [1, 2, 3, 4, 5]:
         label = f"{n_rounds} round{'s' if n_rounds > 1 else ''}"
         print(f"\n  Training: {label}...")
@@ -239,6 +261,9 @@ def ablation_configs():
         torch.manual_seed(42)
         patterns = F.normalize(torch.randn(K, d), dim=-1)
 
+        # Bayes optimal
+        acc_opt, mse_opt = eval_bayes_optimal(patterns, K, noise_std)
+
         # Baseline
         model_base = StandardAttention(d, beta_init=2.0)
         acc_base, det_base = train_and_eval(model_base, patterns, d, K, noise_std)
@@ -249,10 +274,11 @@ def ablation_configs():
 
         delta = acc_boost - acc_base
         results[label] = {
-            "baseline": acc_base, "boosted": acc_boost, "delta": delta,
+            "bayes_optimal": acc_opt, "baseline": acc_base,
+            "boosted": acc_boost, "delta": delta,
             "d": d, "K": K, "noise_std": noise_std,
         }
-        print(f"    Baseline: {acc_base:.1f}%  Boosted: {acc_boost:.1f}%  Delta: {delta:+.1f}%")
+        print(f"    Bayes opt: {acc_opt:.1f}%  Baseline: {acc_base:.1f}%  Boosted: {acc_boost:.1f}%  Delta: {delta:+.1f}%")
 
     return results
 
@@ -266,9 +292,12 @@ def plot_ablations(rounds_results, gate_results, config_results, save_path=None)
 
     # Panel 1: Number of rounds
     ax = axes[0, 0]
-    n_rounds_list = sorted(rounds_results.keys())
+    n_rounds_list = sorted(k for k in rounds_results.keys() if isinstance(k, int))
     accs = [rounds_results[n]["acc"] for n in n_rounds_list]
     ax.plot(n_rounds_list, accs, 'o-', color='#2ecc71', linewidth=2.5, markersize=10)
+    if "bayes_optimal" in rounds_results:
+        ax.axhline(rounds_results["bayes_optimal"]["acc"], color='#9b59b6',
+                   linestyle=':', label=f'Bayes optimal: {rounds_results["bayes_optimal"]["acc"]:.1f}%')
     ax.axhline(rounds_results[1]["acc"], color='#e74c3c', linestyle='--',
                label=f'Baseline (1 round): {rounds_results[1]["acc"]:.1f}%')
     ax.set_xlabel('Number of Boosting Rounds', fontsize=12)
@@ -334,6 +363,54 @@ def plot_ablations(rounds_results, gate_results, config_results, save_path=None)
     print(f"\nSaved: {save_path}")
 
 
+def save_results(rounds_results, gate_results, config_results):
+    """Save all ablation results to JSON."""
+    out = {
+        "ablation_rounds": {},
+        "ablation_gate": {},
+        "ablation_configs": {},
+        "setup": {
+            "seed": 42, "epochs": 150, "lr": 0.003,
+            "batch_size": 512, "device": str(DEVICE),
+            "loss": "MSE",
+        },
+    }
+
+    for k, v in rounds_results.items():
+        key = str(k)
+        if isinstance(v, dict) and "acc" in v:
+            entry = {"acc": round(v["acc"], 1)}
+            if "mse" in v:
+                entry["mse"] = round(v["mse"], 6)
+            if k != "bayes_optimal" and 1 in rounds_results:
+                entry["delta_vs_1"] = round(v["acc"] - rounds_results[1]["acc"], 1)
+            out["ablation_rounds"][key] = entry
+
+    for gt, v in gate_results.items():
+        out["ablation_gate"][gt] = {"acc": round(v["acc"], 1)}
+
+    for label, v in config_results.items():
+        key = label.replace(" ", "").replace("σ", "s").replace(",s", ",s=")
+        if ",s=" not in key:
+            key = key.replace(",s", ",s=")
+        parts = label.split(", ")
+        d_str = parts[0].split("=")[1]
+        K_str = parts[1].split("=")[1]
+        s_str = parts[2].split("=")[1]
+        key = f"d={d_str},K={K_str},s={s_str}"
+        out["ablation_configs"][key] = {
+            "bayes_optimal": round(v["bayes_optimal"], 1),
+            "baseline": round(v["baseline"], 1),
+            "boosted": round(v["boosted"], 1),
+            "delta": round(v["delta"], 1),
+        }
+
+    path = RESULTS_DIR / "exp_ablations.json"
+    with open(path, "w") as f:
+        json.dump(out, f, indent=2)
+    print(f"\nSaved results: {path}")
+
+
 if __name__ == "__main__":
     t0 = time.time()
 
@@ -341,6 +418,7 @@ if __name__ == "__main__":
     gate_results = ablation_gate(d=64, K=16, noise_std=0.5)
     config_results = ablation_configs()
 
+    save_results(rounds_results, gate_results, config_results)
     plot_ablations(rounds_results, gate_results, config_results)
 
     print(f"\nTotal time: {time.time() - t0:.1f}s ({(time.time() - t0)/60:.1f}min)")

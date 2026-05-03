@@ -22,6 +22,15 @@ RESULTS_DIR = Path(__file__).parent.parent / 'results'
 CKPT_DIR = RESULTS_DIR / 'checkpoints'
 
 
+def find_checkpoint(name):
+    """Find checkpoint file, trying new naming format first then old."""
+    for prefix in ['wikitext103_', '']:
+        path = CKPT_DIR / f'{prefix}{name}'
+        if path.exists():
+            return path
+    raise FileNotFoundError(f'No checkpoint found for {name}')
+
+
 def load_model(path, vocab_size, attn_type, d_model=256, n_layers=4,
                n_heads=4, n_rounds=2):
     model = TransformerLM(vocab_size, d_model, n_layers, n_heads, 256,
@@ -66,14 +75,14 @@ def main():
 
     # Load models (seed 42)
     print('\nLoading standard model...')
-    model_std = load_model(CKPT_DIR / 'small_Standard_seed42.pt',
+    model_std = load_model(find_checkpoint('small_Standard_seed42.pt'),
                            vocab_size, 'standard')
     print('Computing per-token losses (standard)...')
     loss_std, token_ids = per_token_loss(model_std, test_data)
     del model_std
 
     print('\nLoading boosted model...')
-    model_boost = load_model(CKPT_DIR / 'small_Boosted-2_seed42.pt',
+    model_boost = load_model(find_checkpoint('small_Boosted-2_seed42.pt'),
                              vocab_size, 'boosted')
     print('Computing per-token losses (boosted)...')
     loss_boost, _ = per_token_loss(model_boost, test_data)

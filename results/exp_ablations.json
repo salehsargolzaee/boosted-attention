@@ -1,95 +1,110 @@
 {
   "ablation_rounds": {
+    "bayes_optimal": {
+      "acc": 58.4,
+      "mse": 0.008277
+    },
     "1": {
-      "acc": 41.3,
+      "acc": 46.0,
       "delta_vs_1": 0.0
     },
     "2": {
-      "acc": 54.8,
-      "delta_vs_1": 13.5
+      "acc": 55.5,
+      "delta_vs_1": 9.5
     },
     "3": {
-      "acc": 55.1,
-      "delta_vs_1": 13.8
+      "acc": 57.6,
+      "delta_vs_1": 11.6
     },
     "4": {
-      "acc": 56.4,
-      "delta_vs_1": 15.1
+      "acc": 58.1,
+      "delta_vs_1": 12.1
     },
     "5": {
-      "acc": 55.8,
-      "delta_vs_1": 14.5
+      "acc": 57.0,
+      "delta_vs_1": 11.0
     }
   },
   "ablation_gate": {
     "mlp": {
-      "acc": 55.2
+      "acc": 55.6
     },
     "scalar": {
-      "acc": 55.0
+      "acc": 56.5
     },
     "none": {
-      "acc": 54.3
+      "acc": 55.4
     },
     "baseline": {
-      "acc": 48.3
+      "acc": 48.2
     }
   },
   "ablation_configs": {
     "d=32,K=8,s=0.3": {
-      "baseline": 90.5,
-      "boosted": 92.4,
-      "delta": 1.9
+      "bayes_optimal": 93.6,
+      "baseline": 77.0,
+      "boosted": 91.6,
+      "delta": 14.6
     },
     "d=32,K=8,s=0.5": {
-      "baseline": 64.9,
-      "boosted": 66.8,
-      "delta": 1.9
+      "bayes_optimal": 68.1,
+      "baseline": 58.0,
+      "boosted": 67.6,
+      "delta": 9.6
     },
     "d=32,K=8,s=0.8": {
-      "baseline": 42.1,
-      "boosted": 43.6,
-      "delta": 1.4
+      "bayes_optimal": 44.8,
+      "baseline": 39.2,
+      "boosted": 44.1,
+      "delta": 5.0
     },
     "d=32,K=8,s=1.2": {
-      "baseline": 29.4,
-      "boosted": 29.9,
-      "delta": 0.5
+      "bayes_optimal": 30.7,
+      "baseline": 27.0,
+      "boosted": 30.8,
+      "delta": 3.8
     },
     "d=64,K=16,s=0.3": {
-      "baseline": 68.7,
-      "boosted": 87.4,
-      "delta": 18.7
+      "bayes_optimal": 90.1,
+      "baseline": 71.0,
+      "boosted": 88.8,
+      "delta": 17.8
     },
     "d=64,K=16,s=0.5": {
-      "baseline": 41.3,
-      "boosted": 54.8,
-      "delta": 13.4
+      "bayes_optimal": 58.4,
+      "baseline": 46.0,
+      "boosted": 55.5,
+      "delta": 9.5
     },
     "d=64,K=16,s=0.8": {
-      "baseline": 24.7,
-      "boosted": 30.2,
-      "delta": 5.5
+      "bayes_optimal": 33.1,
+      "baseline": 26.1,
+      "boosted": 30.3,
+      "delta": 4.2
     },
     "d=64,K=16,s=1.2": {
-      "baseline": 16.0,
-      "boosted": 18.5,
-      "delta": 2.5
+      "bayes_optimal": 20.8,
+      "baseline": 16.4,
+      "boosted": 17.8,
+      "delta": 1.4
     },
     "d=128,K=32,s=0.3": {
-      "baseline": 64.6,
-      "boosted": 80.2,
-      "delta": 15.7
+      "bayes_optimal": 86.9,
+      "baseline": 68.9,
+      "boosted": 82.4,
+      "delta": 13.5
     },
     "d=128,K=32,s=0.5": {
-      "baseline": 30.5,
-      "boosted": 38.7,
-      "delta": 8.2
+      "bayes_optimal": 48.0,
+      "baseline": 33.2,
+      "boosted": 40.3,
+      "delta": 7.2
     },
     "d=128,K=32,s=0.8": {
-      "baseline": 13.6,
-      "boosted": 17.1,
-      "delta": 3.5
+      "bayes_optimal": 23.2,
+      "baseline": 15.3,
+      "boosted": 18.1,
+      "delta": 2.9
     }
   },
   "setup": {
@@ -98,6 +113,6 @@
     "lr": 0.003,
     "batch_size": 512,
     "device": "mps",
-    "task": "denoising (cosine + cross-entropy loss)"
+    "loss": "MSE"
   }
 }
